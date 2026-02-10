@@ -1,0 +1,15 @@
+[package]
+name = "waker_protocol"
+version = "0.1.0"
+edition = "2024"
+
+license = "MIT OR Apache-2.0"
+description = "using the crate waker_tables creating custom waker logic"
+
+authors = ["James Hunt <jameshuntdevelopment@gmail.com>"]
+repository = "https://github.com/jameshuntt/waker_protocol"
+readme = "readme.md"
+
+[dependencies]
+waker_tables = "0.1.0"
+tokio = { version = "1.44.1", features = ["full"] }

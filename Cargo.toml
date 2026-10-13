@@ -1,15 +1,17 @@
 [package]
 name = "waker_protocol"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 license = "MIT OR Apache-2.0"
-description = "using the crate waker_tables creating custom waker logic"
+description = "Custom waker protocol on top of waker_tables: a task scheduler with QoS policy, checkpoints, typed envelopes and capitulation (a task surrenders with a stated reason so the work can go elsewhere)."
 
-authors = ["James Hunt <jameshuntdevelopment@gmail.com>"]
+authors = ["James Hunt <james@1o.business>"]
 repository = "https://github.com/jameshuntt/waker_protocol"
 readme = "readme.md"
+exclude = ["waker_protocol.txt", ".vscode/"]
 
 [dependencies]
-waker_tables = "0.1.0"
-tokio = { version = "1.44.1", features = ["full"] }
+waker_tables = "0.1.4"
+crossbeam-channel = "0.5.15"
+# tokio = { version = "1.44.1", features = ["full"] }

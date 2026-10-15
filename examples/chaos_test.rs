@@ -5,6 +5,12 @@ use waker_protocol::{
 use waker_tables::VTableKey;
 use std::time::{Instant};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+// What the run did, counted by the tasks themselves.
+static POLLS: AtomicUsize = AtomicUsize::new(0);
+static COMPLETED: AtomicUsize = AtomicUsize::new(0);
+static FREED: AtomicUsize = AtomicUsize::new(0);
 
 // --- 1. The Stateful Chaos Task ---
 struct ChaosTask {
@@ -13,6 +19,12 @@ struct ChaosTask {
     #[allow(dead_code)]
     wake_counts: HashMap<WakeReason, usize>,
     is_cancelled: bool,
+}
+
+impl Drop for ChaosTask {
+    fn drop(&mut self) {
+        FREED.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 // unsafe impl ProtocolTask for ChaosTask {
@@ -36,6 +48,7 @@ struct ChaosTask {
 // SAFETY: the functions only touch `self`, and `restore` panics rather than misreading short bytes.
 unsafe impl ProtocolTask for ChaosTask {
     unsafe fn poll(&mut self) -> TaskPoll {
+        POLLS.fetch_add(1, Ordering::Relaxed);
         if self.is_cancelled { return TaskPoll::Ready; }
 
         // Push 1KB of data EVERY poll cycle. 
@@ -45,7 +58,12 @@ unsafe impl ProtocolTask for ChaosTask {
             self.state.push(val as u64);
         }
         
-        if self.state.len() > 5000 { TaskPoll::Ready } else { TaskPoll::Yield }
+        if self.state.len() > 5000 {
+            COMPLETED.fetch_add(1, Ordering::Relaxed);
+            TaskPoll::Ready
+        } else {
+            TaskPoll::Yield
+        }
     }
     // ... rest of implementation ...
 
@@ -92,10 +110,10 @@ fn main() -> Result<(), String> {
     //     policy.qos = if i % 5 == 0 { QoSClass::Interactive } else { QoSClass::Background };
 
     
-    for i in 0..1000 {
-        // FORCE RECLAMATION: Tell the scheduler this task should only use 1KB.
-        // When it hits 5KB in the poll, the scheduler MUST react.
-        // Background tasks are evicted first.
+    for i in 0..task_count {
+        // A 1 KiB budget at Background. ChaosTask does not override footprint_estimate, so the
+        // strategy sees only the struct (well under 1 KiB), never the Vec's heap: the budget rule
+        // never fires, and the run below asserts exactly that.
         let policy = TaskPolicy {
             memory_budget_hint: Some(1024),
             qos: QoSClass::Background,
@@ -193,6 +211,15 @@ fn main() -> Result<(), String> {
         let sample = &sched.reclaim_log[0];
         println!("Sample Reclaim: Task {:?} for reason {:?}", sample.id, sample.reason);
     }
+
+    // The real outcome: every task fills its state in five polls and finishes, each is freed
+    // once, and the thousands of wakes sent to finished tasks reach nothing. Nothing is
+    // reclaimed, because the footprint the strategy sees stays under the budget (see above).
+    assert_eq!(POLLS.load(Ordering::Relaxed), 5 * task_count, "five polls per task");
+    assert_eq!(COMPLETED.load(Ordering::Relaxed), task_count, "every task finished");
+    assert_eq!(FREED.load(Ordering::Relaxed), task_count, "every task freed exactly once");
+    assert!(sched.tasks.live_ids().is_empty(), "every finished task left the scheduler");
+    assert!(sched.reclaim_log.is_empty(), "nothing reclaimed");
 
     Ok(())
 }

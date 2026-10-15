@@ -70,7 +70,9 @@ pub struct TaskPolicy {
     pub qos: QoSClass,
     /// Restore a dormant task when it is woken (the default).
     pub auto_restore_on_wake: bool,
-    /// Poll again in the same round after `Yield` (the default).
+    /// After `Yield`, keep the task runnable so the next `run_once` or `pump` polls it again (the
+    /// default); a task is polled at most once per round. When false, `Yield` parks the task
+    /// like `Pending`, until a wake.
     pub eager_repoll_after_yield: bool,
     /// Checkpoint retention.
     pub retention: RetentionPolicy,

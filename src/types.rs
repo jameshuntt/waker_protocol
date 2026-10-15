@@ -3,7 +3,8 @@ use crate::envelope::EnvelopePacket;
 use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-/// A task's slot in the slab plus the slot's generation; a stale id never reaches a newer task.
+/// A task's slot in the slab plus the slot's generation; a stale id never reaches a newer task,
+/// because a slot is retired rather than given a generation it has had before.
 pub struct TaskId {
     /// The slab slot.
     pub slot: u32,
@@ -69,13 +70,14 @@ pub enum TaskPoll {
     Ready,
     /// Waiting to be woken.
     Pending,
-    /// Run again soon (at once if the policy says eager repoll).
+    /// Run again: in the next round when the task's policy has `eager_repoll_after_yield` (the
+    /// default), otherwise not until a wake, like `Pending`.
     Yield,
     /// Waiting, like Pending.
     Park,
     /// Save me and go dormant.
     Checkpoint(CheckpointReason),
-    /// Surrender: checkpoint and go dormant if the plan keeps a stub, otherwise finish.
+    /// Surrender: checkpoint and go dormant if the plan keeps a stub, otherwise end as Completed.
     Capitulate(CapitulatePlan),
     /// Stopped by cancellation.
     Cancelled,
@@ -172,6 +174,8 @@ pub enum SchedulerMsg {
         /// The task.
         id: TaskId,
     },
-    /// Checkpoint every task and stop.
+    /// Checkpoint every live task and stop. Once it is handled, `run_once` and `pump` restore and
+    /// poll nothing, and every later message stays in the channel. A task whose checkpoint cannot
+    /// be saved stays live in its row, and the error is returned.
     Shutdown,
 }

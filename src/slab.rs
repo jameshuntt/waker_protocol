@@ -5,7 +5,9 @@ struct Slot<T> {
     value: Option<T>,
 }
 
-/// Slots of `T`, each reused with a new generation so an old id cannot reach a new value.
+/// Slots of `T`. A freed slot is reused with the next generation, and a slot whose generation
+/// has reached `u32::MAX` is retired instead of wrapping, so an old id never reaches a new value.
+/// A retired slot stays empty for good: one slot's memory per 2^32 reuses.
 pub struct TaskSlab<T> {
     slots: Vec<Slot<T>>,
     free: Vec<u32>,
@@ -65,8 +67,11 @@ impl<T> TaskSlab<T> {
         }
 
         let value = slot.value.take()?;
-        slot.generation = slot.generation.wrapping_add(1);
-        self.free.push(id.slot);
+        // At the last generation the slot is retired: never reused, so no old id matches it again.
+        if let Some(next) = slot.generation.checked_add(1) {
+            slot.generation = next;
+            self.free.push(id.slot);
+        }
         Some(value)
     }
 
@@ -81,5 +86,28 @@ impl<T> TaskSlab<T> {
         }
 
         out
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_slot_is_retired_instead_of_wrapping_its_generation() {
+        let mut slab = TaskSlab::default();
+        let old = slab.insert("old");
+        assert_eq!(slab.remove(old), Some("old"));
+
+        // Fast-forward slot 0 to its last generation, as 2^32 - 1 more reuses would.
+        slab.slots[0].generation = u32::MAX;
+        let last = slab.insert("last");
+        assert_eq!(last, TaskId::new(0, u32::MAX));
+        assert_eq!(slab.remove(last), Some("last"));
+
+        let new = slab.insert("new");
+        assert_eq!(slab.get(old), None, "old {old:?} must not reach new {new:?}");
+        assert_eq!(slab.get(last), None);
+        assert_ne!(new.slot, old.slot, "slot 0 is retired");
+        assert_eq!(slab.live_ids(), vec![new]);
     }
 }

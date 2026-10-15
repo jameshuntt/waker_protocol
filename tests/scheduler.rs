@@ -2,12 +2,16 @@
 //! or never fails here, and Miri reports any leak or bad read.
 
 use std::cell::{Cell, RefCell};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::Context;
+use std::time::Duration;
 
 use waker_protocol::{
-    derive_protocol_task_vtable, scheduler_waker, typed_envelope, CapitulatePlan, CheckpointReason,
-    CheckpointStore, MemoryCheckpointStore, ProtocolTask, ProtocolTaskPtr, QoSClass,
-    Resident, RetentionPolicy, SchedulerConfig, SchedulerMsg, TaskId, TaskPoll, TaskPolicy, TaskSlab,
+    derive_protocol_task_vtable, scheduler_waker, typed_envelope, CapitulatePlan, CapitulateStrategy,
+    CheckpointHandle, CheckpointReason, CheckpointStore, DefaultCapitulateStrategy,
+    MemoryCheckpointStore, ProtocolTask, ProtocolTaskPtr, QoSClass, Resident, RetentionPolicy,
+    SchedulerConfig, SchedulerMsg, TaskEntry, TaskId, TaskPoll, TaskPolicy, TaskSlab, TaskSnapshot,
     TaskState, WakeOrdering, WakeReason, WakerProtocol,
 };
 use waker_tables::VTableKey;
@@ -97,10 +101,37 @@ const COUNTER: VTableKey = VTableKey { segment: "test", kind: "counter", version
 const OTHER: VTableKey = VTableKey { segment: "test", kind: "other", version: 1 };
 
 fn scheduler() -> WakerProtocol<MemoryCheckpointStore> {
-    let sched = WakerProtocol::new(MemoryCheckpointStore::default());
+    scheduler_with(MemoryCheckpointStore::default(), Box::new(DefaultCapitulateStrategy::default()))
+}
+
+fn scheduler_with<S: CheckpointStore>(store: S, strategy: Box<dyn CapitulateStrategy>) -> WakerProtocol<S> {
+    let sched = WakerProtocol::with_strategy(store, strategy);
     sched.register_vtable(COUNTER, &COUNTER_VTABLE);
     sched.register_vtable(OTHER, &OTHER_VTABLE);
+    sched.register_vtable(SCRIPTED, &SCRIPTED_VTABLE);
     sched
+}
+
+fn row<S: CheckpointStore>(sched: &WakerProtocol<S>, id: TaskId) -> &TaskEntry<S::Handle> {
+    sched.tasks.get(id).expect("the task's row is there")
+}
+
+fn is_live<S: CheckpointStore>(sched: &WakerProtocol<S>, id: TaskId) -> bool {
+    matches!(row(sched, id).resident, Resident::Live(_))
+}
+
+fn clear_order() {
+    ORDER.with(|o| o.borrow_mut().clear());
+}
+
+fn order() -> Vec<&'static str> {
+    ORDER.with(|o| o.borrow().clone())
+}
+
+/// A message `deliver` that writes its text to ORDER.
+fn note(_: &mut Counter, text: &'static str) -> Result<(), String> {
+    ORDER.with(|o| o.borrow_mut().push(text));
+    Ok(())
 }
 
 fn live_counter(sched: &WakerProtocol<MemoryCheckpointStore>, id: TaskId) -> &ProtocolTaskPtr {
@@ -182,9 +213,17 @@ fn a_message_for_another_type_is_refused_not_delivered() {
         task.0 = n;
         Ok(())
     });
+    let before = drops();
     let err = deliver_raw(&mut sched, SchedulerMsg::Deliver { id: handle.id(), envelope: wrong }).unwrap_err();
     assert!(err.contains("targets another task type than scheduler::Counter"), "{err}");
-    assert!(sched.tasks.get(handle.id()).is_some());
+    assert_eq!(drops() - before, 0, "only the message is dropped, never the task");
+    assert!(is_live(&sched, handle.id()), "the task stays live in its row");
+    assert_eq!(row(&sched, handle.id()).stats.poll_count, 2, "and the round went on to poll it");
+
+    clear_order();
+    handle.send("note", "right type", note).unwrap();
+    sched.run_once().unwrap();
+    assert_eq!(order(), ["right type", "t"], "a message of the right type still arrives");
 }
 
 /// Push a hand-built message through the scheduler's own channel and run once.
@@ -406,4 +445,671 @@ fn retention_keep_latest_prunes_older_checkpoints() {
     assert!(sched.store.load(&handles[1]).is_err());
     assert!(sched.store.load(&handles[2]).is_ok());
     assert_eq!(sched.tasks.get(h.id()).unwrap().checkpoint_history.len(), 1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Tasks, stores and strategies for the 0.3.1 tests below.
+
+/// Poll results a [`Scripted`] task can be told to give, one byte each.
+const READY: u8 = 0;
+const PENDING: u8 = 1;
+const YIELD: u8 = 2;
+const CHECKPOINT: u8 = 3;
+const CAPITULATE: u8 = 4;
+const CANCELLED: u8 = 5;
+const FAILED: u8 = 6;
+
+/// Gives the polls in `script` in turn and then repeats the last one; reports `footprint` as its
+/// size; keeps its place in the script across a checkpoint.
+struct Scripted {
+    step: u32,
+    footprint: u32,
+    script: Vec<u8>,
+}
+
+impl Scripted {
+    fn boxed(footprint: u32, script: &[u8]) -> Box<Self> {
+        Box::new(Self { step: 0, footprint, script: script.to_vec() })
+    }
+}
+
+impl Drop for Scripted {
+    fn drop(&mut self) {
+        DROPS.with(|d| d.set(d.get() + 1));
+    }
+}
+
+// SAFETY: the functions only touch `self`; `restore` panics on short bytes.
+unsafe impl ProtocolTask for Scripted {
+    unsafe fn poll(&mut self) -> TaskPoll {
+        let code = self.script[(self.step as usize).min(self.script.len() - 1)];
+        self.step += 1;
+        match code {
+            READY => TaskPoll::Ready,
+            PENDING => TaskPoll::Pending,
+            YIELD => TaskPoll::Yield,
+            CHECKPOINT => TaskPoll::Checkpoint(CheckpointReason::Manual),
+            CAPITULATE => TaskPoll::Capitulate(CapitulatePlan { reason: CheckpointReason::QoS, retain_stub: false }),
+            CANCELLED => TaskPoll::Cancelled,
+            _ => TaskPoll::Failed("scripted failure".into()),
+        }
+    }
+
+    unsafe fn checkpoint(&mut self) -> Vec<u8> {
+        let mut bytes = self.step.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&self.footprint.to_le_bytes());
+        bytes.extend_from_slice(&self.script);
+        bytes
+    }
+
+    unsafe fn restore(bytes: &[u8]) -> Self {
+        Self {
+            step: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+            footprint: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            script: bytes[8..].to_vec(),
+        }
+    }
+
+    fn footprint_estimate(&self) -> usize {
+        self.footprint as usize
+    }
+}
+
+derive_protocol_task_vtable!(Scripted, SCRIPTED_VTABLE);
+const SCRIPTED: VTableKey = VTableKey { segment: "test", kind: "scripted", version: 1 };
+
+/// A checkpoint store whose `save` fails while told to.
+#[derive(Default)]
+struct FlakyStore {
+    inner: MemoryCheckpointStore,
+    failing: AtomicBool,
+}
+
+impl FlakyStore {
+    fn fail(&self, on: bool) {
+        self.failing.store(on, Ordering::SeqCst);
+    }
+}
+
+impl CheckpointStore for FlakyStore {
+    type Handle = CheckpointHandle;
+
+    fn save(&self, task_id: TaskId, payload: Vec<u8>) -> Result<CheckpointHandle, String> {
+        if self.failing.load(Ordering::SeqCst) {
+            return Err("disk full".into());
+        }
+        self.inner.save(task_id, payload)
+    }
+
+    fn load(&self, handle: &CheckpointHandle) -> Result<Vec<u8>, String> {
+        self.inner.load(handle)
+    }
+
+    fn remove(&self, handle: &CheckpointHandle) -> Result<(), String> {
+        self.inner.remove(handle)
+    }
+}
+
+fn flaky() -> WakerProtocol<FlakyStore> {
+    scheduler_with(FlakyStore::default(), Box::new(DefaultCapitulateStrategy::default()))
+}
+
+/// Capitulates with its plan whenever the task's newest wake is `QoS`.
+struct OnQoS(CapitulatePlan);
+
+impl CapitulateStrategy for OnQoS {
+    fn plan(&self, _: &TaskSnapshot, last_wake: Option<&WakeReason>) -> Option<CapitulatePlan> {
+        matches!(last_wake, Some(WakeReason::QoS)).then(|| self.0.clone())
+    }
+}
+
+/// Writes down every snapshot it is shown, then asks the default strategy.
+struct Recording {
+    seen: Arc<Mutex<Vec<TaskSnapshot>>>,
+    inner: DefaultCapitulateStrategy,
+}
+
+impl CapitulateStrategy for Recording {
+    fn plan(&self, snapshot: &TaskSnapshot, last_wake: Option<&WakeReason>) -> Option<CapitulatePlan> {
+        self.seen.lock().unwrap().push(snapshot.clone());
+        self.inner.plan(snapshot, last_wake)
+    }
+}
+
+/// The default strategy with every threshold at zero, so its rules fire without waiting.
+fn eager_default_strategy() -> DefaultCapitulateStrategy {
+    DefaultCapitulateStrategy {
+        min_footprint_bytes: 0,
+        idle_before_checkpoint: Duration::ZERO,
+        protect_qos_at_or_above: QoSClass::Realtime,
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// An error drops one message, or leaves one task as it was; it never destroys a task, and the
+// round goes on.
+
+#[test]
+fn a_failed_delivery_drops_only_that_message() {
+    let mut sched = scheduler();
+    let before = drops();
+    let h = sched.spawn_box(COUNTER, Counter::boxed("d", 100), TaskPolicy::default()).unwrap();
+    sched.run_once().unwrap();
+    clear_order();
+
+    h.send("bad", "bad", |_, _| Err("rejected".into())).unwrap();
+    h.send("good", "good", note).unwrap();
+    assert_eq!(sched.run_once().unwrap_err(), "rejected");
+
+    assert_eq!(drops() - before, 0, "the task is not freed");
+    assert!(is_live(&sched, h.id()));
+    assert_eq!(order(), ["good", "d"], "the next message is delivered and the task is polled");
+}
+
+#[test]
+fn an_error_never_skips_removing_tasks_that_finished_earlier_in_the_round() {
+    let mut sched = scheduler();
+    let realtime = TaskPolicy { qos: QoSClass::Realtime, ..TaskPolicy::default() };
+    let done = sched.spawn_box(COUNTER, Counter::boxed("done", 2), realtime).unwrap();
+    let victim = sched.spawn_box(COUNTER, Counter::boxed("victim", 100), TaskPolicy::default()).unwrap();
+    sched.run_once().unwrap();
+    done.checkpoint(CheckpointReason::Manual).unwrap();
+    sched.run_once().unwrap();
+    let ckpt = sched.reclaim_log[0].handle.clone().unwrap();
+
+    // One round: `done` (Realtime, so polled first) finishes, then `victim`'s message fails.
+    done.wake(WakeReason::Manual).unwrap();
+    victim.send("bad", "bad", |_, _| Err("nope".into())).unwrap();
+    assert_eq!(sched.run_once().unwrap_err(), "nope");
+
+    assert!(sched.tasks.get(done.id()).is_none(), "the finished task is removed in the same round");
+    assert!(sched.store.load(&ckpt).is_err(), "with its checkpoint (retain_on_completion is false)");
+    assert!(is_live(&sched, victim.id()));
+}
+
+#[test]
+fn a_checkpoint_that_cannot_be_saved_leaves_the_task_live_as_it_was() {
+    let mut sched = flaky();
+    let before = drops();
+    let h = sched.spawn_box(SCRIPTED, Scripted::boxed(64, &[CHECKPOINT]), TaskPolicy::default()).unwrap();
+    sched.store.fail(true);
+    assert_eq!(sched.run_once().unwrap_err(), "disk full");
+
+    assert_eq!(drops() - before, 0, "nothing was saved, so nothing is freed");
+    let entry = row(&sched, h.id());
+    assert!(matches!(entry.resident, Resident::Live(_)));
+    assert_eq!(entry.state, TaskState::Runnable);
+    assert_eq!(entry.stats.checkpoint_count, 0);
+
+    sched.store.fail(false);
+    sched.run_once().unwrap();
+    let entry = row(&sched, h.id());
+    assert!(matches!(entry.resident, Resident::Dormant), "polled again, and this save goes through");
+    assert_eq!(entry.stats.checkpoint_count, 1);
+    assert_eq!(drops() - before, 1);
+}
+
+#[test]
+fn a_strategy_checkpoint_that_cannot_be_saved_leaves_the_task_live() {
+    let plan = CapitulatePlan { reason: CheckpointReason::QoS, retain_stub: true };
+    let mut sched = scheduler_with(FlakyStore::default(), Box::new(OnQoS(plan)));
+    let before = drops();
+    let h = sched.spawn_box(COUNTER, Counter::boxed("q", 100), TaskPolicy::default()).unwrap();
+    sched.run_once().unwrap();
+    clear_order();
+
+    sched.store.fail(true);
+    h.send("note", "delivered", note).unwrap();
+    h.wake(WakeReason::QoS).unwrap();
+    assert_eq!(sched.run_once().unwrap_err(), "disk full");
+    assert_eq!(drops() - before, 0);
+    assert!(is_live(&sched, h.id()));
+    assert_eq!(order(), ["delivered"], "the message reached the task; the plan stopped the poll");
+
+    sched.store.fail(false);
+    sched.run_once().unwrap();
+    assert!(matches!(row(&sched, h.id()).resident, Resident::Dormant));
+}
+
+#[test]
+fn a_checkpoint_or_capitulate_message_that_cannot_be_saved_leaves_the_task_live() {
+    let mut sched = flaky();
+    let before = drops();
+    let a = sched.spawn_box(COUNTER, Counter::boxed("a", 100), TaskPolicy::default()).unwrap();
+    let b = sched.spawn_box(COUNTER, Counter::boxed("b", 100), TaskPolicy::default()).unwrap();
+    sched.run_once().unwrap();
+
+    sched.store.fail(true);
+    a.checkpoint(CheckpointReason::Manual).unwrap();
+    b.capitulate(CapitulatePlan { reason: CheckpointReason::QoS, retain_stub: true }).unwrap();
+    let err = sched.run_once().unwrap_err();
+    assert_eq!(drops() - before, 0);
+    for id in [a.id(), b.id()] {
+        assert!(is_live(&sched, id));
+        assert_eq!(row(&sched, id).state, TaskState::Waiting, "as it was");
+    }
+    assert_eq!(err, "disk full; disk full", "both errors, after the round");
+
+    sched.store.fail(false);
+    a.checkpoint(CheckpointReason::Manual).unwrap();
+    b.capitulate(CapitulatePlan { reason: CheckpointReason::QoS, retain_stub: true }).unwrap();
+    sched.run_once().unwrap();
+    for id in [a.id(), b.id()] {
+        assert!(matches!(row(&sched, id).resident, Resident::Dormant));
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Shutdown checkpoints every live task and then does nothing more.
+
+#[test]
+fn shutdown_returns_every_failed_save_and_keeps_those_tasks_live() {
+    let mut sched = flaky();
+    let before = drops();
+    let ids: Vec<TaskId> = (0..3)
+        .map(|_| sched.spawn_box(COUNTER, Counter::boxed("s", 100), TaskPolicy::default()).unwrap().id())
+        .collect();
+    sched.run_once().unwrap();
+
+    sched.store.fail(true);
+    sched.handle().shutdown().unwrap();
+    let result = sched.pump(Duration::from_millis(1));
+    assert_eq!(drops() - before, 0, "no task is freed without its checkpoint");
+    assert!(ids.iter().all(|id| is_live(&sched, *id)));
+    assert_eq!(result, Err("disk full; disk full; disk full".to_string()), "every failed save is returned");
+    assert!(sched.shutdown);
+
+    // Once the store works, clear the flag and shut down again.
+    sched.store.fail(false);
+    sched.shutdown = false;
+    sched.handle().shutdown().unwrap();
+    assert!(!sched.pump(Duration::from_millis(1)).unwrap());
+    assert!(ids.iter().all(|id| matches!(row(&sched, *id).resident, Resident::Dormant)));
+}
+
+#[test]
+fn after_shutdown_nothing_is_restored_or_polled_and_later_work_stays_queued() {
+    let mut sched = scheduler();
+    let a = sched.spawn_box(COUNTER, Counter::boxed("a", 100), TaskPolicy::default()).unwrap();
+    let b = sched.spawn_box(COUNTER, Counter::boxed("b", 100), TaskPolicy::default()).unwrap();
+    sched.run_once().unwrap();
+    clear_order();
+
+    a.send("note", "queued before shutdown", note).unwrap();
+    sched.handle().shutdown().unwrap();
+    b.wake(WakeReason::Manual).unwrap();
+    assert!(!sched.pump(Duration::from_millis(1)).unwrap());
+    a.wake(WakeReason::Manual).unwrap();
+    sched.run_once().unwrap();
+    assert!(!sched.pump(Duration::from_millis(1)).unwrap());
+
+    for id in [a.id(), b.id()] {
+        let entry = row(&sched, id);
+        assert!(matches!(entry.resident, Resident::Dormant));
+        assert_eq!((entry.stats.poll_count, entry.stats.restore_count), (1, 0), "not restored, not polled");
+    }
+    assert!(order().is_empty(), "nothing was delivered or polled");
+    assert_eq!(row(&sched, a.id()).mailbox.len(), 1, "the message queued before shutdown is kept");
+    assert_eq!(sched.sender().len(), 2, "the two wakes sent after it wait in the channel");
+}
+
+#[test]
+fn a_wake_queued_before_a_checkpoint_message_still_brings_the_task_back() {
+    let mut sched = scheduler();
+    let h = sched.spawn_box(COUNTER, Counter::boxed("w", 100), TaskPolicy::default()).unwrap();
+    sched.run_once().unwrap();
+
+    scheduler_waker(h.id(), sched.sender(), WakeReason::Condition).wake();
+    h.checkpoint(CheckpointReason::Manual).unwrap();
+    sched.run_once().unwrap();
+
+    let entry = row(&sched, h.id());
+    assert_eq!(entry.stats.checkpoint_count, 1);
+    assert_eq!(entry.stats.restore_count, 1, "the wake restored it");
+    assert_eq!(entry.stats.poll_count, 2, "and it was polled for the wake");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Yield, pump and the capitulation strategy do what their docs say.
+
+#[test]
+fn yield_runs_again_next_round_when_eager_and_waits_for_a_wake_when_not() {
+    let mut sched = scheduler();
+    let eager = sched.spawn_box(SCRIPTED, Scripted::boxed(64, &[YIELD]), TaskPolicy::default()).unwrap();
+    let lazy_policy = TaskPolicy { eager_repoll_after_yield: false, ..TaskPolicy::default() };
+    let lazy = sched.spawn_box(SCRIPTED, Scripted::boxed(64, &[YIELD]), lazy_policy).unwrap();
+
+    for round in 1..=3 {
+        sched.run_once().unwrap();
+        assert_eq!(row(&sched, eager.id()).stats.poll_count, round, "one poll per run_once, never two");
+        assert_eq!(row(&sched, lazy.id()).stats.poll_count, 1, "parked until a wake");
+    }
+    assert_eq!(row(&sched, lazy.id()).state, TaskState::Waiting);
+
+    lazy.wake(WakeReason::Manual).unwrap();
+    sched.run_once().unwrap();
+    sched.run_once().unwrap();
+    assert_eq!(row(&sched, lazy.id()).stats.poll_count, 2, "one poll per wake");
+}
+
+#[test]
+fn pump_keeps_returning_true_with_every_handle_dropped_until_shutdown() {
+    let mut sched = scheduler();
+    let h = sched.spawn_box(COUNTER, Counter::boxed("p", 100), TaskPolicy::default()).unwrap();
+    drop(h);
+    drop(sched.handle());
+    for _ in 0..3 {
+        assert!(sched.pump(Duration::from_millis(1)).unwrap(), "the scheduler holds its own sender");
+    }
+    sched.sender().send(SchedulerMsg::Shutdown).unwrap();
+    assert!(!sched.pump(Duration::from_millis(1)).unwrap());
+}
+
+#[test]
+fn every_capitulation_without_a_stub_ends_the_task_as_completed() {
+    // retain_on_completion is on, so a task that ends Completed keeps its latest checkpoint.
+    let policy = TaskPolicy {
+        retention: RetentionPolicy { retain_on_completion: true, ..RetentionPolicy::default() },
+        ..TaskPolicy::default()
+    };
+    let no_stub = CapitulatePlan { reason: CheckpointReason::QoS, retain_stub: false };
+    let mut sched = scheduler_with(MemoryCheckpointStore::default(), Box::new(OnQoS(no_stub.clone())));
+    let before = drops();
+    let by_poll = sched.spawn_box(SCRIPTED, Scripted::boxed(64, &[CHECKPOINT, CAPITULATE]), policy.clone()).unwrap();
+    let by_message = sched.spawn_box(COUNTER, Counter::boxed("m", 100), policy.clone()).unwrap();
+    let by_strategy = sched.spawn_box(COUNTER, Counter::boxed("s", 100), policy).unwrap();
+    sched.run_once().unwrap(); // by_poll checkpoints itself
+    by_message.checkpoint(CheckpointReason::Manual).unwrap();
+    by_strategy.checkpoint(CheckpointReason::Manual).unwrap();
+    sched.run_once().unwrap();
+    let ckpts: Vec<_> = sched.reclaim_log.iter().map(|r| r.handle.clone().unwrap()).collect();
+    assert_eq!(ckpts.len(), 3);
+
+    for h in [by_message.id(), by_poll.id(), by_strategy.id()] {
+        sched.handle().wake(h, WakeReason::Manual).unwrap();
+    }
+    sched.run_once().unwrap(); // all restored; by_poll capitulates in its poll
+    by_message.capitulate(no_stub).unwrap();
+    by_strategy.wake(WakeReason::QoS).unwrap();
+    sched.run_once().unwrap();
+
+    for id in [by_poll.id(), by_message.id(), by_strategy.id()] {
+        assert!(sched.tasks.get(id).is_none(), "{id:?} is removed");
+    }
+    assert_eq!(drops() - before, 6, "three checkpointed copies and three restored copies, each freed once");
+    for ckpt in &ckpts {
+        assert!(sched.store.load(ckpt).is_ok(), "ended Completed, so retain_on_completion keeps {ckpt:?}");
+    }
+}
+
+#[test]
+fn the_strategy_sees_waiting_messages_and_wakes_before_they_are_delivered() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let strategy = Recording { seen: seen.clone(), inner: eager_default_strategy() };
+    let mut sched = scheduler_with(MemoryCheckpointStore::default(), Box::new(strategy));
+    let h = sched.spawn_box(COUNTER, Counter::boxed("i", 100), TaskPolicy::default()).unwrap();
+    sched.run_once().unwrap();
+    for _ in 0..5 {
+        h.send("note", "work", note).unwrap();
+    }
+    sched.run_once().unwrap();
+
+    let counts: Vec<_> = seen.lock().unwrap().iter().map(|s| (s.mailbox_len, s.pending_wakes)).collect();
+    assert_eq!(counts, [(0, 1), (5, 5)], "(messages, wakes) waiting when the strategy looked");
+    let entry = row(&sched, h.id());
+    assert!(sched.reclaim_log.is_empty(), "the idle rule spares a task with waiting work");
+    assert_eq!(entry.stats.poll_count, 2);
+    assert!(matches!(entry.resident, Resident::Live(_)));
+}
+
+#[test]
+fn the_idle_rule_checkpoints_a_task_with_no_waiting_work_and_a_wake_brings_it_back() {
+    let mut sched = scheduler_with(MemoryCheckpointStore::default(), Box::new(eager_default_strategy()));
+    let h = sched.spawn_box(SCRIPTED, Scripted::boxed(64, &[YIELD]), TaskPolicy::default()).unwrap();
+    sched.run_once().unwrap(); // polled; Yield keeps it runnable
+    sched.run_once().unwrap(); // runnable with nothing waiting: idle
+    assert_eq!(sched.reclaim_log.len(), 1);
+    assert_eq!(sched.reclaim_log[0].reason, CheckpointReason::Idle);
+    assert!(matches!(row(&sched, h.id()).resident, Resident::Dormant));
+
+    h.wake(WakeReason::Manual).unwrap();
+    sched.run_once().unwrap();
+    let entry = row(&sched, h.id());
+    assert_eq!(entry.stats.restore_count, 1);
+    assert_eq!(entry.stats.poll_count, 2, "woken, restored and polled");
+    assert_eq!(sched.reclaim_log.len(), 1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The default strategy's rules, the poll order, the message order, and every way a task ends.
+
+#[test]
+fn memory_pressure_reclaims_below_interactive_but_never_interactive_or_above() {
+    let mut sched = scheduler();
+    let classes = [QoSClass::Realtime, QoSClass::Interactive, QoSClass::Standard, QoSClass::Batch, QoSClass::Background];
+    let big: Vec<TaskId> = classes
+        .iter()
+        .map(|&qos| {
+            let policy = TaskPolicy { qos, ..TaskPolicy::default() };
+            sched.spawn_box(SCRIPTED, Scripted::boxed(8192, &[PENDING]), policy).unwrap().id()
+        })
+        .collect();
+    let small_policy = TaskPolicy { qos: QoSClass::Background, ..TaskPolicy::default() };
+    let small = sched.spawn_box(SCRIPTED, Scripted::boxed(100, &[PENDING]), small_policy).unwrap().id();
+    sched.run_once().unwrap();
+    for &id in big.iter().chain([&small]) {
+        sched.handle().wake(id, WakeReason::MemoryPressure).unwrap();
+    }
+    sched.run_once().unwrap();
+
+    let reclaimed: Vec<TaskId> = sched.reclaim_log.iter().map(|r| r.id).collect();
+    assert_eq!(reclaimed, big[2..], "Standard, Batch and Background, in poll order");
+    assert!(sched.reclaim_log.iter().all(|r| r.reason == CheckpointReason::MemoryPressure));
+    for &id in big[..2].iter().chain([&small]) {
+        assert!(is_live(&sched, id), "protected or too small: {id:?}");
+        assert_eq!(row(&sched, id).stats.poll_count, 2);
+    }
+}
+
+#[test]
+fn the_budget_rule_reclaims_only_batch_and_below_over_their_budget() {
+    let mut sched = scheduler();
+    let budget = |qos| TaskPolicy { qos, memory_budget_hint: Some(1024), ..TaskPolicy::default() };
+    let over_batch = sched.spawn_box(SCRIPTED, Scripted::boxed(2048, &[PENDING]), budget(QoSClass::Batch)).unwrap();
+    let over_standard = sched.spawn_box(SCRIPTED, Scripted::boxed(2048, &[PENDING]), budget(QoSClass::Standard)).unwrap();
+    let under_background = sched.spawn_box(SCRIPTED, Scripted::boxed(512, &[PENDING]), budget(QoSClass::Background)).unwrap();
+    sched.run_once().unwrap();
+
+    assert_eq!(sched.reclaim_log.len(), 1);
+    assert_eq!(sched.reclaim_log[0].id, over_batch.id());
+    assert_eq!(sched.reclaim_log[0].reason, CheckpointReason::YieldForSla);
+    assert!(is_live(&sched, over_standard.id()));
+    assert!(is_live(&sched, under_background.id()));
+}
+
+#[test]
+fn the_default_order_polls_higher_classes_first() {
+    let mut sched = scheduler();
+    assert_eq!(sched.config.wake_ordering, WakeOrdering::BiasedQoSThenAge);
+    clear_order();
+    let policy = |qos| TaskPolicy { qos, ..TaskPolicy::default() };
+    sched.spawn_box(COUNTER, Counter::boxed("background", 9), policy(QoSClass::Background)).unwrap();
+    sched.spawn_box(COUNTER, Counter::boxed("realtime", 9), policy(QoSClass::Realtime)).unwrap();
+    sched.spawn_box(COUNTER, Counter::boxed("standard", 9), policy(QoSClass::Standard)).unwrap();
+    sched.run_once().unwrap();
+    assert_eq!(order(), ["realtime", "standard", "background"]);
+}
+
+#[test]
+fn the_default_order_polls_the_one_polled_longest_ago_first_within_a_class() {
+    let mut sched = scheduler();
+    let a = sched.spawn_box(COUNTER, Counter::boxed("a", 100), TaskPolicy::default()).unwrap();
+    sched.run_once().unwrap();
+    std::thread::sleep(Duration::from_millis(1));
+    let b = sched.spawn_box(COUNTER, Counter::boxed("b", 100), TaskPolicy::default()).unwrap();
+    sched.run_once().unwrap();
+    clear_order();
+
+    // b became runnable first, but a was polled longer ago.
+    b.wake(WakeReason::Manual).unwrap();
+    a.wake(WakeReason::Manual).unwrap();
+    sched.run_once().unwrap();
+    assert_eq!(order(), ["a", "b"]);
+}
+
+#[test]
+fn round_robin_starts_one_later_each_round() {
+    let mut sched = scheduler();
+    sched.config = SchedulerConfig { wake_ordering: WakeOrdering::UnbiasedRoundRobin };
+    let handles: Vec<_> = ["a", "b", "c"]
+        .map(|name| sched.spawn_box(COUNTER, Counter::boxed(name, 100), TaskPolicy::default()).unwrap())
+        .into();
+    let mut rounds = Vec::new();
+    for _ in 0..3 {
+        clear_order();
+        for h in &handles {
+            h.wake(WakeReason::Manual).unwrap();
+        }
+        sched.run_once().unwrap();
+        rounds.push(order());
+    }
+    assert_eq!(rounds, [["a", "b", "c"], ["b", "c", "a"], ["c", "a", "b"]]);
+}
+
+#[test]
+fn messages_arrive_in_the_order_they_were_sent() {
+    let mut sched = scheduler();
+    let h = sched.spawn_box(COUNTER, Counter::boxed("m", 100), TaskPolicy::default()).unwrap();
+    sched.run_once().unwrap();
+    clear_order();
+    for text in ["1", "2", "3"] {
+        h.send("note", text, note).unwrap();
+    }
+    sched.run_once().unwrap();
+    assert_eq!(order(), ["1", "2", "3", "m"]);
+}
+
+#[test]
+fn every_terminal_poll_removes_and_frees_the_task_and_retention_decides_its_checkpoint() {
+    let with = |change: fn(&mut RetentionPolicy)| {
+        let mut retention = RetentionPolicy::default();
+        change(&mut retention);
+        retention
+    };
+    let cases = [
+        (READY, with(|_| {}), false),
+        (READY, with(|r| r.retain_on_completion = true), true),
+        (CAPITULATE, with(|_| {}), false),
+        (CAPITULATE, with(|r| r.retain_on_completion = true), true),
+        (FAILED, with(|_| {}), true),
+        (FAILED, with(|r| r.retain_on_failure = false), false),
+        (CANCELLED, with(|_| {}), false),
+        (CANCELLED, with(|r| r.retain_on_cancel = true), true),
+    ];
+    for (code, retention, kept) in cases {
+        let mut sched = scheduler();
+        let before = drops();
+        let policy = TaskPolicy { retention, ..TaskPolicy::default() };
+        let h = sched.spawn_box(SCRIPTED, Scripted::boxed(64, &[CHECKPOINT, code]), policy).unwrap();
+        sched.run_once().unwrap(); // checkpoints itself
+        let ckpt = sched.reclaim_log[0].handle.clone().unwrap();
+        h.wake(WakeReason::Manual).unwrap();
+        sched.run_once().unwrap(); // restored, then ends with `code`
+
+        assert!(sched.tasks.get(h.id()).is_none(), "code {code}: removed");
+        assert_eq!(drops() - before, 2, "code {code}: both copies freed, once each");
+        assert_eq!(sched.store.load(&ckpt).is_ok(), kept, "code {code}: checkpoint kept?");
+    }
+}
+
+#[test]
+fn a_dormant_task_keeps_its_checkpoint_even_with_keep_latest_zero() {
+    let mut sched = scheduler();
+    let policy = TaskPolicy {
+        retention: RetentionPolicy { keep_latest: 0, ..RetentionPolicy::default() },
+        ..TaskPolicy::default()
+    };
+    let h = sched.spawn_box(COUNTER, Counter::boxed("z", 100), policy).unwrap();
+    sched.run_once().unwrap();
+    h.checkpoint(CheckpointReason::Manual).unwrap();
+    sched.run_once().unwrap();
+    assert_eq!(row(&sched, h.id()).checkpoint_history.len(), 1);
+
+    h.wake(WakeReason::Manual).unwrap();
+    sched.run_once().unwrap();
+    assert_eq!(row(&sched, h.id()).stats.restore_count, 1);
+}
+
+#[test]
+fn checkpoints_a_task_asks_for_are_pruned_to_keep_latest() {
+    let mut sched = scheduler();
+    let h = sched.spawn_box(SCRIPTED, Scripted::boxed(64, &[CHECKPOINT]), TaskPolicy::default()).unwrap();
+    sched.run_once().unwrap();
+    for _ in 0..2 {
+        h.wake(WakeReason::Manual).unwrap();
+        sched.run_once().unwrap();
+    }
+    let handles: Vec<_> = sched.reclaim_log.iter().map(|r| r.handle.clone().unwrap()).collect();
+    assert_eq!(handles.len(), 3);
+    assert!(sched.store.load(&handles[0]).is_err());
+    assert!(sched.store.load(&handles[1]).is_err());
+    assert!(sched.store.load(&handles[2]).is_ok());
+    assert_eq!(row(&sched, h.id()).checkpoint_history.len(), 1);
+}
+
+#[test]
+fn a_dormant_task_stays_dormant_when_auto_restore_is_off() {
+    let mut sched = scheduler();
+    let policy = TaskPolicy { auto_restore_on_wake: false, ..TaskPolicy::default() };
+    let h = sched.spawn_box(COUNTER, Counter::boxed("n", 100), policy).unwrap();
+    sched.run_once().unwrap();
+    h.checkpoint(CheckpointReason::Manual).unwrap();
+    sched.run_once().unwrap();
+    h.wake(WakeReason::Manual).unwrap();
+    sched.run_once().unwrap();
+
+    let entry = row(&sched, h.id());
+    assert!(matches!(entry.resident, Resident::Dormant));
+    assert_eq!((entry.stats.restore_count, entry.stats.poll_count), (0, 1));
+}
+
+#[test]
+fn a_restored_task_is_told_it_resumed() {
+    let mut sched = scheduler();
+    let h = sched.spawn_box(COUNTER, Counter::boxed("r", 100), TaskPolicy::default()).unwrap();
+    sched.run_once().unwrap();
+    h.checkpoint(CheckpointReason::Manual).unwrap();
+    sched.run_once().unwrap();
+    h.wake(WakeReason::Timer).unwrap();
+    sched.run_once().unwrap();
+
+    let entry = row(&sched, h.id());
+    assert_eq!(entry.stats.restore_count, 1);
+    assert_eq!(entry.stats.last_wake, Some(WakeReason::Resume), "Resume comes after the wake that restored it");
+}
+
+#[test]
+fn a_reclaim_report_counts_the_bytes_freed() {
+    let mut sched = scheduler();
+    sched.spawn_box(SCRIPTED, Scripted::boxed(5000, &[CHECKPOINT]), TaskPolicy::default()).unwrap();
+    sched.run_once().unwrap();
+    let r = &sched.reclaim_log[0];
+    let id_size = std::mem::size_of::<TaskId>();
+    assert_eq!((r.before_bytes, r.after_bytes, r.reclaimed_bytes), (5000, id_size, 5000 - id_size));
+}
+
+/// The whole run of 2^32 reuses that the unit test in src/slab.rs fast-forwards. About 7 s in
+/// release: `cargo test --release --test scheduler -- --ignored`.
+#[test]
+#[ignore = "2^32 slab reuses; run in release with --ignored"]
+fn slab_ids_stay_stale_after_every_generation_of_a_slot_is_used() {
+    let mut slab = TaskSlab::default();
+    let old = slab.insert(0u64);
+    slab.remove(old);
+    for n in 1..=u64::from(u32::MAX) {
+        let id = slab.insert(n);
+        slab.remove(id);
+    }
+    let new = slab.insert(u64::MAX);
+    assert_eq!(slab.get(old), None, "old {old:?}, new {new:?}");
 }

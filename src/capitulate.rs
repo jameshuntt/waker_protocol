@@ -6,12 +6,15 @@ use std::time::Duration;
 pub struct CapitulatePlan {
     /// Why.
     pub reason: CheckpointReason,
-    /// Keep a checkpoint and go dormant (true) or finish and be removed (false).
+    /// Keep a checkpoint and go dormant (true), or end as Completed and be removed (false); the
+    /// task's checkpoints then follow `retain_on_completion`. The same from a poll, a strategy
+    /// or a Capitulate message.
     pub retain_stub: bool,
 }
 
 #[derive(Debug, Clone)]
-/// What a capitulation strategy sees of a task.
+/// What a capitulation strategy sees of a task: the task as it was before this round's messages
+/// and wakes were delivered.
 pub struct TaskSnapshot {
     /// The task.
     pub id: TaskId,
@@ -21,9 +24,9 @@ pub struct TaskSnapshot {
     pub state: TaskState,
     /// Its own size estimate.
     pub footprint_bytes: usize,
-    /// Messages waiting for it.
+    /// Messages waiting for it, counted before this round delivers them.
     pub mailbox_len: usize,
-    /// Wakes waiting for it.
+    /// Wakes waiting for it, counted before this round delivers them (a restore adds `Resume`).
     pub pending_wakes: usize,
     /// How many times it was polled.
     pub poll_count: u64,
@@ -51,6 +54,11 @@ pub struct ReclaimReport<H> {
 }
 
 /// Decides, before each poll, whether a task should capitulate.
+///
+/// It sees the task as it was before this round's messages and wakes were delivered, and
+/// `last_wake` is the newest wake the task has been sent, this round's included. If it returns a
+/// plan, the messages and wakes are delivered first, so the checkpoint holds them, and the task is
+/// not polled.
 pub trait CapitulateStrategy: Send + Sync + 'static {
     /// A plan to capitulate, or `None` to poll as usual.
     fn plan(

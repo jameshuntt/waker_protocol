@@ -1,12 +1,17 @@
 use waker_protocol::{
-    derive_protocol_task_vtable, MemoryCheckpointStore, ProtocolTask, QoSClass, TaskPolicy,
-    TaskPoll, WakeReason, WakerProtocol,
+    derive_protocol_task_vtable, DefaultCapitulateStrategy, MemoryCheckpointStore, ProtocolTask,
+    QoSClass, TaskPolicy, TaskPoll, WakeReason, WakerProtocol,
 };
 use waker_tables::VTableKey;
+
+/// The UI task's frame buffer: big enough for the memory-pressure rule, so only its QoS class
+/// keeps it from being reclaimed.
+const FRAMEBUFFER_BYTES: usize = 8 * 1024;
 
 #[derive(Debug)]
 struct UiTask {
     frames: usize,
+    framebuffer: Vec<u8>,
 }
 
 // SAFETY: the functions only touch `self`, and `restore` panics rather than misreading short bytes.
@@ -25,7 +30,12 @@ unsafe impl ProtocolTask for UiTask {
         arr.copy_from_slice(&bytes[..std::mem::size_of::<usize>()]);
         Self {
             frames: usize::from_le_bytes(arr),
+            framebuffer: vec![0; FRAMEBUFFER_BYTES],
         }
+    }
+
+    fn footprint_estimate(&self) -> usize {
+        std::mem::size_of::<Self>() + self.framebuffer.capacity()
     }
 }
 
@@ -90,7 +100,11 @@ fn main() -> Result<(), String> {
         ..TaskPolicy::default()
     };
 
-    let ui = sched.spawn_box(ui_key, Box::new(UiTask { frames: 0 }), ui_policy)?;
+    let ui = sched.spawn_box(
+        ui_key,
+        Box::new(UiTask { frames: 0, framebuffer: vec![0; FRAMEBUFFER_BYTES] }),
+        ui_policy,
+    )?;
     let batch = sched.spawn_box(
         batch_key,
         Box::new(IndexerTask {
@@ -111,6 +125,9 @@ fn main() -> Result<(), String> {
     assert_eq!(first.id, batch.id());
     assert_eq!(first.reason, waker_protocol::CheckpointReason::MemoryPressure);
     assert_eq!(sched.tasks.get(batch.id()).unwrap().stats.restore_count, 0);
+    // The UI task is over the size the default strategy reclaims under memory pressure, so the
+    // check below holds only because Interactive and above are protected.
+    assert!(FRAMEBUFFER_BYTES >= DefaultCapitulateStrategy::default().min_footprint_bytes);
     assert!(sched.reclaim_log.iter().all(|e| e.id != ui.id()), "the interactive task is never reclaimed");
     Ok(())
 }

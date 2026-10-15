@@ -58,7 +58,8 @@ and nothing more, and `restore` must accept any bytes the checkpoint store retur
 
 Fixes from reviews of 0.3.1 and of this release's drafts, and what 0.3.0 removed from 0.2.0, put
 back. No public signature changed. New public items: the field
-`WakerProtocol::finished`, and the 0.2.0 items listed under **Put back from 0.2.0**.
+`WakerProtocol::finished`, and the items listed under **Put back from 0.2.0**, except
+`type_name()` and `vtable()`, which are public since 0.3.0.
 
 - **A restored task runs before it can be checkpointed again.** The capitulation strategy is not
   asked about a task restored from a checkpoint until that task has been polled once, whatever
@@ -101,19 +102,30 @@ back. No public signature changed. New public items: the field
   `deliver` that returned `Err`: that message is dropped, the task stays live and is polled, the
   round goes on, and the error (`message "kind" for task ... panicked: ...`) is returned with the
   round's other errors. In 0.3.1 it reached the caller, freed the task and left its row as
-  `Resident::Empty` for good.
+  `Resident::Empty` for good. The same holds for a panic in the `kind` or `target_type` of an
+  `Envelope` written by hand: the message is not delivered, and the error says which one
+  panicked. Both are called with the message only borrowed, so their panic never drops the
+  message while it unwinds; the message is then dropped on its own, and a panic in that drop is
+  an error too. In 0.3.1 a panic in `target_type`, or in `kind` as a message was refused,
+  reached the caller as a `deliver` panic did.
 - **A panic in `cleanup` or in a task's `Drop` is an error, not a stop.** When the scheduler frees
   a task (at the task's end, or once its checkpoint is saved) and the task's `cleanup` or `Drop`
   panics, the panic is caught: the task is freed anyway, its row is left removed or dormant as it
   would have been, the round goes on, and the error (`task ... panicked in cleanup or drop: ...`)
-  is returned after the round. So is a panic in the drop of a message still queued for a task
-  that ends. And when `cleanup` panics, the task's own drop now runs after that panic is caught,
-  not while it unwinds, so a panic in the drop as well no longer aborts the process; that holds
-  wherever a `ProtocolTaskPtr` is dropped. In 0.3.1 a panic in `cleanup` or `Drop` reached the
-  caller and left the task's row as `Resident::Empty` for good (after a checkpoint, with the
-  saved checkpoint left out of the task's history); a panic in a queued message's drop reached
-  the caller with the row removed and the task's checkpoints left in the store; and a panic in
-  both `cleanup` and `Drop` aborted the process.
+  is returned after the round. So is a panic in the drop of a message that is not delivered:
+  one still queued for a task that ends, one sent to a task that has already ended, or one
+  refused. And with a vtable from `ProtocolVTable::of` or `derive_protocol_task_vtable!`, when
+  `cleanup` panics, the task's own drop now runs after that panic is caught, not while it
+  unwinds, so a panic in the drop as well no longer aborts the process; that holds wherever a
+  `ProtocolTaskPtr` with such a vtable is dropped. A vtable from `ProtocolVTable::from_raw_parts`
+  gets the same only if its destroy function holds a `cleanup` panic until the task is dropped;
+  one written as 0.2.0's macro wrote it (`Box::from_raw`, then `cleanup()`) still aborts when
+  both panic. In 0.3.1 a panic in `cleanup` or `Drop` reached the caller and left the task's row
+  as `Resident::Empty` for good (after a checkpoint, with the saved checkpoint left out of the
+  task's history); a panic in a queued message's drop reached the caller with the row removed
+  and the task's checkpoints left in the store; a panic in the drop of a message sent to a task
+  that had ended reached the caller, and the round's other errors and the rest of the round were
+  lost; and a panic in both `cleanup` and `Drop` aborted the process.
 - **What a panic from the checkpoint store leaves.** A panic from the store's `save` or from the
   capitulation strategy still reaches the caller, but the task is put back in its row, live,
   first, so the scheduler still works if the caller catches the panic. A panic from the store's
@@ -131,37 +143,58 @@ back. No public signature changed. New public items: the field
 - **Strategy docs.** `CapitulateStrategy` is asked before a poll, but not before the first poll
   after a restore, and `TaskSnapshot::pending_wakes` never counts a restore's `Resume`; the docs
   said "before each poll" and "a restore adds `Resume`".
-- **Put back from 0.2.0.** 0.3.0 removed these, and its notes did not say so. Each is back. The
-  public fields of `ProtocolVTable` and `ProtocolTaskPtr` let safe code cause undefined behavior
-  in 0.2.0, so building either from parts comes back as an `unsafe fn` whose `# Safety` section
-  says what the caller must promise; safe code still cannot.
+- **Put back from 0.2.0.** 0.3.0 removed these. Its notes said the fields of `ProtocolVTable`
+  and `ProtocolTaskPtr` became private, but not that reading them or building from parts went
+  with the fields, and they did not mention `TASK_WAKE_SIGNAL_RAW_VTABLE` or `raw_data` at all.
+  Each is back. The public fields of `ProtocolVTable` and `ProtocolTaskPtr` let safe code cause
+  undefined behavior in 0.2.0, so building either from parts comes back as an `unsafe fn` whose
+  `# Safety` section says what the caller must promise; safe code still cannot.
   - `TASK_WAKE_SIGNAL_RAW_VTABLE`, the raw waker vtable of `TaskWakeSignal`, declared as in 0.2.0
     with `declare_raw_waker_vtable!(TaskWakeSignal, TASK_WAKE_SIGNAL_RAW_VTABLE)` and reached at
     the crate root. 0.3.0 dropped it, with no safety reason, when `waker_from_arc` stopped taking
-    a vtable.
+    a vtable. It is back as a copy at its own address, not as the vtable the crate's wakers
+    carry, which it was in 0.2.0. A waker from `scheduler_waker`, and every clone of a
+    `TaskWakeSignal` waker (a clone of one built on this static included), carries
+    `<TaskWakeSignal as UnsafeWakeable>::raw_waker_vtable()`, the static
+    `derive_arc_unsafe_wakeable!` declares. So a waker's vtable compared with this static's
+    address is not equal, and a waker built on it does not `will_wake` its own clone; in 0.2.0
+    both were true. To recognise a `TaskWakeSignal` waker by its vtable, compare it with
+    `raw_waker_vtable()`. The reason: waker_tables 0.3's `waker_from_arc` takes no vtable, and
+    its derive gives no way to name the static it declares.
   - `ProtocolTaskPtr::raw_data(&mut self) -> *mut ()`, public again and `unsafe`, as in 0.2.0.
-  - `ProtocolVTable`'s functions and type name. In 0.2.0 its fields were public, so safe code
-    could build a vtable whose functions read a task as another type. The fields stay private.
-    `poll_fn()`, `wake_fn()`, `checkpoint_fn()`, `restore_fn()`, `destroy_fn()` and
-    `footprint_fn()` read each function (calling one is `unsafe`), and `type_name()` reads the
-    name. `ProtocolVTable::from_raw_parts::<T>(..)`, an `unsafe const fn`, builds a vtable from
-    hand-written functions, recorded as running `T`; it can build a `static`.
+  - `ProtocolVTable`'s functions. In 0.2.0 its fields were public, so safe code could build a
+    vtable whose functions read a task as another type. The fields stay private. `poll_fn()`,
+    `wake_fn()`, `checkpoint_fn()`, `restore_fn()`, `destroy_fn()` and `footprint_fn()` read each
+    function (calling one is `unsafe`); `type_name()`, which reads the type's name, has been
+    public since 0.3.0. `ProtocolVTable::from_raw_parts::<T>(..)`, an `unsafe const fn`, builds a
+    vtable from hand-written functions, recorded as running `T`; it can build a `static`.
   - `ProtocolTaskPtr`'s pointer and vtable. In 0.2.0 its fields were public, so safe code could
     pair a task with another type's vtable, or a dangling pointer with any vtable, and the drop
-    freed it. The fields stay private. `ProtocolTaskPtr::from_raw_parts(data, vtable)`, an
-    `unsafe fn`, owns a task given as the two parts; `into_raw_parts(self)` gives both back
-    without freeing the task.
+    freed it. The fields stay private. `ProtocolTaskPtr::data(&self) -> *mut ()` reads the task
+    pointer through a shared reference, as `p.data` did (for example on a `Resident::Live(p)`
+    reached from `sched.tasks.get(id)`); reading it is safe, using it is `unsafe`.
+    `vtable(&self)` has read the vtable since 0.3.0. To own a task given as the two parts,
+    `ProtocolTaskPtr::from_raw_parts(data, vtable)`, an `unsafe fn`; `into_raw_parts(self)`
+    gives both back without freeing the task.
 - **Debug output names the type by its full path.** `{:?}` of a `ProtocolVTable` shows
   `type_name` as `std::any::type_name` gives it (`my_crate::jobs::Job`), where 0.2.0 showed the
   type as written in `derive_protocol_task_vtable!` (`Job`). This changed in 0.3.0 and stays: it
   is the same value the vtable's type check uses. `ProtocolTaskPtr`'s `{:?}`, new in 0.3.0, shows
   the same full path.
+- **`derive_protocol_task_vtable!` calls the `ProtocolTask` functions.** Since 0.3.0 it expands
+  to `ProtocolVTable::of::<T>()`, whose functions call the trait's `poll`, `on_wake`,
+  `checkpoint`, `cleanup` and `footprint_estimate`. 0.2.0's expansion called them with method
+  syntax on the type, so an inherent method of the same name, when the type had one, ran in
+  place of the trait's. Such a method no longer runs from the scheduler, with no error: move its
+  body into the `ProtocolTask` impl. This changed in 0.3.0 and stays, because the vtable runs
+  exactly the functions the type's `ProtocolTask` impl declares.
 - **Tests.** A test for each fix above, each run against the code before the fix first, where it
   fails: 0.3.1's code, or the draft's for a fix to the draft. A fix to the docs alone has its test
   in `tests/doc_claims.rs`, which checks that the old sentence is gone and the new one is there.
-  `tests/from_0_2.rs` uses every item put back from 0.2.0; it does not compile against 0.3.1. The
-  test for a handle that stays stuck passed before too, because that code was right; it fails on
-  a prune that keeps retrying the stuck handle, which the earlier test did not catch.
+  `tests/from_0_2.rs` uses every item put back from 0.2.0, so it does not compile against 0.3.1,
+  and checks each difference from 0.2.0 this section names. The test for a handle that stays
+  stuck passed before too, because that code was right; it fails on a prune that keeps retrying
+  the stuck handle, which the earlier test did not catch.
 
 ## 0.3.1
 

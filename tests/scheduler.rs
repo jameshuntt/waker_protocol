@@ -1,6 +1,7 @@
 //! The scheduler end to end. Tasks count their drops in a thread-local, so a task freed twice
 //! or never fails here, and Miri reports any leak or bad read.
 
+use std::any::TypeId;
 use std::cell::{Cell, RefCell};
 use std::panic::{catch_unwind, panic_any, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,7 +11,7 @@ use std::time::Duration;
 
 use waker_protocol::{
     derive_protocol_task_vtable, scheduler_waker, typed_envelope, CapitulatePlan, CapitulateStrategy,
-    CheckpointHandle, CheckpointReason, CheckpointStore, DefaultCapitulateStrategy,
+    CheckpointHandle, Envelope, CheckpointReason, CheckpointStore, DefaultCapitulateStrategy,
     MemoryCheckpointStore, ProtocolTask, ProtocolTaskPtr, QoSClass, Resident, RetentionPolicy,
     SchedulerConfig, SchedulerMsg, TaskEntry, TaskId, TaskPoll, TaskPolicy, TaskSlab, TaskSnapshot,
     TaskState, WakeOrdering, WakeReason, WakerProtocol,
@@ -1999,5 +2000,175 @@ fn an_over_budget_task_gets_no_poll_for_a_qos_or_memory_pressure_wake_and_one_fo
         assert_eq!(entry.stats.poll_count, if gets_a_poll { 2 } else { 1 }, "{reason:?}");
         assert_eq!(entry.state, if gets_a_poll { TaskState::Waiting } else { TaskState::Dormant }, "{reason:?}");
         assert_eq!(entry.stats.last_wake, Some(if gets_a_poll { WakeReason::Resume } else { reason.clone() }), "{reason:?}: on_wake heard it");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// 0.3.2, fourth review: a panic in a message's `kind` or `target_type` is caught with the message
+// only borrowed, and a message for a task that has already ended is dropped under the same rule.
+
+/// Where a [`Faulty`] message panics.
+const IN_KIND: u8 = 1;
+const IN_TARGET: u8 = 2;
+const IN_MESSAGE_DROP: u8 = 4;
+
+/// A message written by hand for a [`Fragile`] task, whose `kind`, `target_type` or drop panics
+/// where `panic_in` says. Writes "faulty delivered" and "faulty drop" to ORDER.
+struct Faulty {
+    panic_in: u8,
+}
+
+impl Faulty {
+    fn boxed(panic_in: u8) -> Box<Self> {
+        Box::new(Self { panic_in })
+    }
+}
+
+impl Drop for Faulty {
+    fn drop(&mut self) {
+        ORDER.with(|o| o.borrow_mut().push("faulty drop"));
+        if self.panic_in & IN_MESSAGE_DROP != 0 {
+            panic!("boom in a message's drop");
+        }
+    }
+}
+
+// SAFETY: `target_type` is `Fragile` when it returns, and `dispatch` never touches the task.
+unsafe impl Envelope for Faulty {
+    fn kind(&self) -> &'static str {
+        if self.panic_in & IN_KIND != 0 {
+            panic!("boom in kind");
+        }
+        "faulty"
+    }
+
+    fn target_type(&self) -> TypeId {
+        if self.panic_in & IN_TARGET != 0 {
+            panic!("boom in target_type");
+        }
+        TypeId::of::<Fragile>()
+    }
+
+    unsafe fn dispatch(self: Box<Self>, _target: *mut ()) -> Result<(), String> {
+        ORDER.with(|o| o.borrow_mut().push("faulty delivered"));
+        Ok(())
+    }
+}
+
+#[test]
+fn a_panic_in_a_messages_kind_or_target_type_loses_only_that_message_and_never_aborts() {
+    let mut sched = scheduler();
+    let before = drops();
+    let h = sched.spawn_box(FRAGILE, Fragile::boxed(PENDING, 0), TaskPolicy::default()).unwrap();
+    let background = TaskPolicy { qos: QoSClass::Background, ..TaskPolicy::default() };
+    let after = sched.spawn_box(COUNTER, Counter::boxed("after", 100), background).unwrap();
+    sched.run_once().unwrap();
+    clear_order();
+
+    // Each of these panics; with IN_MESSAGE_DROP the message's drop panics too, which while the
+    // first panic unwound would abort the process.
+    for panic_in in [IN_KIND, IN_KIND | IN_MESSAGE_DROP, IN_TARGET, IN_TARGET | IN_MESSAGE_DROP] {
+        sched.sender().send(SchedulerMsg::Deliver { id: h.id(), envelope: Faulty::boxed(panic_in) }).unwrap();
+    }
+    sched.sender().send(SchedulerMsg::Deliver { id: h.id(), envelope: Faulty::boxed(0) }).unwrap();
+    after.wake(WakeReason::Manual).unwrap();
+    let round = catch_unwind(AssertUnwindSafe(|| sched.run_once()));
+
+    let id = h.id();
+    let in_kind = format!("message for task {id:?} panicked in kind: boom in kind");
+    let in_target = format!("message \"faulty\" for task {id:?} panicked in target_type: boom in target_type");
+    let expected = [
+        in_kind.clone(),
+        in_kind,
+        format!("message (its kind panicked) for task {id:?} panicked as it was dropped: boom in a message's drop"),
+        in_target.clone(),
+        in_target,
+        format!("message \"faulty\" for task {id:?} panicked as it was dropped: boom in a message's drop"),
+    ]
+    .join("; ");
+    assert!(matches!(&round, Ok(Err(err)) if *err == expected), "{round:?}");
+    let dropped = ["faulty drop"; 4];
+    assert_eq!(order()[..4], dropped, "each message whose kind or target_type panicked is dropped, not delivered");
+    assert_eq!(order()[4..], ["faulty delivered", "faulty drop", "after"], "the next message is delivered, and the round goes on");
+    assert!(is_live(&sched, h.id()), "the task stays live in its row");
+    assert_eq!(row(&sched, h.id()).stats.poll_count, 2, "and is polled");
+    assert_eq!(drops() - before, 0, "nothing is freed");
+}
+
+#[test]
+fn a_panic_in_kind_at_a_tasks_end_still_frees_everything_and_removes_its_checkpoints() {
+    // Without and with a message behind it whose drop panics; and with a message whose kind and
+    // drop both panic.
+    let queues: [&[u8]; 3] = [&[IN_KIND], &[IN_KIND, IN_MESSAGE_DROP], &[IN_KIND | IN_MESSAGE_DROP]];
+    for queue in queues {
+        let mut sched = flaky();
+        let before = drops();
+        let h = sched.spawn_box(FRAGILE, Fragile::boxed(PENDING, 0), TaskPolicy::default()).unwrap();
+        sched.run_once().unwrap();
+        h.checkpoint(CheckpointReason::Manual).unwrap();
+        sched.run_once().unwrap();
+        let ckpt = row(&sched, h.id()).checkpoint_history[0].clone();
+        h.wake(WakeReason::Manual).unwrap();
+        sched.run_once().unwrap(); // restored and polled: live, with a checkpoint in its history
+
+        for &panic_in in queue {
+            sched.sender().send(SchedulerMsg::Deliver { id: h.id(), envelope: Faulty::boxed(panic_in) }).unwrap();
+        }
+        h.cancel().unwrap();
+        clear_order();
+        let round = catch_unwind(AssertUnwindSafe(|| sched.run_once()));
+
+        let id = h.id();
+        let in_kind = format!("message for task {id:?} panicked in kind: boom in kind");
+        let in_drop = |name: &str| format!("message {name} for task {id:?} panicked as it was dropped: boom in a message's drop");
+        let expected = match queue.len() {
+            1 if queue[0] == IN_KIND => in_kind,
+            1 => [in_kind, in_drop("(its kind panicked)")].join("; "),
+            _ => [in_kind, in_drop("\"faulty\"")].join("; "),
+        };
+        assert!(matches!(&round, Ok(Err(err)) if *err == expected), "{queue:?}: {round:?}");
+        assert!(sched.tasks.get(id).is_none(), "{queue:?}: the row is removed");
+        assert_eq!(sched.finished, [(id, TaskState::Cancelled)], "{queue:?}");
+        assert!(!sched.store.holds(&ckpt), "{queue:?}: its checkpoint is removed from the store");
+        assert_eq!(order().last(), Some(&"store.remove"), "{queue:?}: after the task and its messages are freed");
+        assert_eq!(drops() - before, 2, "{queue:?}: both copies freed once");
+    }
+}
+
+#[test]
+fn a_message_whose_drop_panics_sent_to_a_task_already_ended_is_an_error_for_the_round() {
+    for (to, envelope) in [("typed", None), ("hand-written, kind panics", Some(IN_KIND | IN_MESSAGE_DROP))] {
+        let mut sched = scheduler();
+        let before = drops();
+        let a = sched.spawn_box(FRAGILE, Fragile::boxed(PENDING, 0), TaskPolicy::default()).unwrap();
+        let b = sched.spawn_box(FRAGILE, Fragile::boxed(PENDING, IN_CLEANUP), TaskPolicy::default()).unwrap();
+        let other = sched.spawn_box(COUNTER, Counter::boxed("other", 100), TaskPolicy::default()).unwrap();
+        sched.run_once().unwrap();
+        clear_order();
+
+        // In one round: b's cancel (its cleanup panics: an error noted), a's cancel, a message to
+        // the ended a whose drop panics, then a wake for another task.
+        b.cancel().unwrap();
+        a.cancel().unwrap();
+        match envelope {
+            None => a.send("grenade", Grenade, |_: &mut Fragile, _| Ok(())).unwrap(),
+            Some(panic_in) => sched.sender().send(SchedulerMsg::Deliver { id: a.id(), envelope: Faulty::boxed(panic_in) }).unwrap(),
+        }
+        other.wake(WakeReason::Manual).unwrap();
+        let round = catch_unwind(AssertUnwindSafe(|| sched.run_once()));
+
+        let mut expected = vec![format!("task {:?} panicked in cleanup or drop: boom in cleanup", b.id())];
+        match envelope {
+            None => expected.push(format!("message \"grenade\" for task {:?} panicked as it was dropped: boom in a message's drop", a.id())),
+            Some(_) => {
+                expected.push(format!("message for task {:?} panicked in kind: boom in kind", a.id()));
+                expected.push(format!("message (its kind panicked) for task {:?} panicked as it was dropped: boom in a message's drop", a.id()));
+            }
+        }
+        assert!(matches!(&round, Ok(Err(err)) if *err == expected.join("; ")), "{to}: {round:?}");
+        assert_eq!(row(&sched, other.id()).stats.poll_count, 2, "{to}: the other task is polled in that round");
+        assert_eq!(sched.finished, [(b.id(), TaskState::Cancelled), (a.id(), TaskState::Cancelled)], "{to}");
+        assert_eq!(drops() - before, 2, "{to}: both ended tasks freed once");
+        sched.run_once().unwrap();
     }
 }

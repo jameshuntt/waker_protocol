@@ -205,11 +205,45 @@ fn free(id: TaskId, live: ProtocolTaskPtr) -> Result<(), String> {
     catch(move || drop(live)).map_err(|text| format!("task {id:?} panicked in cleanup or drop: {text}"))
 }
 
-/// Drop `envelope`, a message queued for task `id`, which is ending. A panic in the message's
-/// drop is caught and returned as the error.
-fn drop_message(id: TaskId, envelope: EnvelopePacket) -> Result<(), String> {
-    let kind = envelope.kind();
-    catch(move || drop(envelope)).map_err(|text| format!("message {kind:?} for task {id:?} panicked as it was dropped: {text}"))
+/// Use up `envelope`, a message for task `id`: hand it to `live`, the task, or drop it when there
+/// is no live task to hand it to (the task is ending, or has ended). A message written for another
+/// task type is refused and dropped, and the task is untouched. Only this message is lost, and the
+/// task goes on. Every message `run_once` and `pump` deliver or drop goes through here.
+///
+/// The message's own code runs under [`catch`], so a panic in it is caught and returned as the
+/// error, as an `Err` from `deliver` is. `kind` and `target_type` run with the envelope only
+/// borrowed, so a panic in either never drops it while unwinding (a panic in its drop then would
+/// abort the process); a message whose `kind` or `target_type` panics is not delivered. Then
+/// `dispatch` or the drop takes the envelope, each under its own catch.
+fn deliver_or_drop(id: TaskId, live: Option<&mut ProtocolTaskPtr>, envelope: EnvelopePacket) -> Result<(), String> {
+    let mut errors = Errors::default();
+    let kind = catch(|| envelope.kind());
+    let refused = match (&kind, live) {
+        (Err(text), _) => Some(format!("message for task {id:?} panicked in kind: {text}")),
+        (Ok(_), None) => None,
+        (Ok(kind), Some(live)) => match catch(|| envelope.target_type()) {
+            Err(text) => Some(format!("message {kind:?} for task {id:?} panicked in target_type: {text}")),
+            Ok(target) if target != live.task_type_id() => Some(format!(
+                "envelope {kind:?} for task {id:?} targets another task type than {}",
+                live.vtable().type_name()
+            )),
+            Ok(_) => {
+                return catch(move || {
+                    // SAFETY: the envelope targets exactly the type `live` holds (checked above),
+                    // and `live` is out of its row, so this access is exclusive; `raw_data` itself
+                    // has no requirement beyond that use.
+                    unsafe { envelope.dispatch(live.raw_data()) }
+                })
+                .unwrap_or_else(|text| Err(format!("message {kind:?} for task {id:?} panicked: {text}")));
+            }
+        },
+    };
+    errors.note(refused.map_or(Ok(()), Err));
+    errors.note(catch(move || drop(envelope)).map_err(|text| {
+        let name = kind.map_or_else(|_| "(its kind panicked)".to_owned(), |kind| format!("{kind:?}"));
+        format!("message {name} for task {id:?} panicked as it was dropped: {text}")
+    }));
+    errors.finish()
 }
 
 /// Every error met while a round runs. A round never stops at an error: it finishes, then
@@ -485,7 +519,10 @@ impl<S: CheckpointStore> WakerProtocol<S> {
     /// The scheduler's own channel, for [`scheduler_waker`](crate::scheduler_waker) or a hand-built
     /// [`SchedulerMsg`]. A message for a task of another type is refused when its turn comes: only
     /// that message is dropped, the task goes on, and `run_once` or `pump` returns the error once
-    /// its round is done. A message whose `dispatch` panics is dropped the same way.
+    /// its round is done. A message whose `kind`, `target_type` or `dispatch` panics is lost the
+    /// same way, with the panic as the error. A message sent to a task that has already ended is
+    /// dropped; a panic in the drop of any message that is not delivered is returned as an error
+    /// too.
     pub fn sender(&self) -> Sender<SchedulerMsg> {
         self.tx.clone()
     }
@@ -552,12 +589,14 @@ impl<S: CheckpointStore> WakerProtocol<S> {
     /// A panic in a task's own `poll`, `on_wake`, `checkpoint`, `restore` or `footprint_estimate`
     /// is caught: the task ends as `TaskState::Failed`, with a message naming the panic, and is
     /// removed like any failed task (see [`finished`](Self::finished)); the round goes on. A panic
-    /// in a message's `deliver` is caught and treated as a `deliver` that returned `Err`: only that
-    /// message is lost, the task stays live and is polled, and the error is returned after the
-    /// round. A panic in a task's `cleanup` or `Drop`, or in the drop of a message queued for a
-    /// task that is ending, is caught as the task is freed: the task is freed anyway, its row is
-    /// left removed (the task's end) or dormant (a checkpoint), the error is returned after the
-    /// round, and the round goes on.
+    /// in a message's `deliver`, or in the `kind` or `target_type` of an
+    /// [`Envelope`](crate::Envelope) written by hand, is caught and treated as a `deliver` that
+    /// returned `Err`: only that message is lost, the task stays live and is polled, and the error
+    /// is returned after the round. A panic in a task's `cleanup` or `Drop` is caught as the task
+    /// is freed: the task is freed anyway, its row is left removed (the task's end) or dormant (a
+    /// checkpoint), the error is returned after the round, and the round goes on. So is a panic in
+    /// the drop of a message that is not delivered: one queued for a task that ends, one sent to a
+    /// task that has already ended, or one refused.
     ///
     /// A panic from the store's `save` or from the capitulation strategy reaches the caller, with
     /// the task put back in its row, live.
@@ -642,9 +681,13 @@ impl<S: CheckpointStore> WakerProtocol<S> {
             }
             SchedulerMsg::Deliver { id, envelope } => {
                 let seq = self.bump_seq();
-                if let Some(entry) = self.tasks.get_mut(id) {
-                    entry.mailbox.push_back(envelope);
-                    entry.wake(WakeReason::Inbox, seq);
+                match self.tasks.get_mut(id) {
+                    Some(entry) => {
+                        entry.mailbox.push_back(envelope);
+                        entry.wake(WakeReason::Inbox, seq);
+                    }
+                    // The task has ended (or the id is stale): the message is dropped.
+                    None => errors.note(deliver_or_drop(id, None, envelope)),
                 }
             }
             SchedulerMsg::Checkpoint { id, reason } => {
@@ -800,7 +843,7 @@ impl<S: CheckpointStore> WakerProtocol<S> {
                 Err(panic) => break 'settle Settle::Finish(TaskState::Failed(panic)),
             };
             while let Some(envelope) = entry.mailbox.pop_front() {
-                errors.note(Self::deliver(id, out.task(), envelope));
+                errors.note(deliver_or_drop(id, Some(out.task()), envelope));
             }
             while let Some(reason) = entry.pending_wakes.pop_front() {
                 entry.stats.last_wake = Some(reason.clone());
@@ -826,29 +869,6 @@ impl<S: CheckpointStore> WakerProtocol<S> {
         };
         let live = out.release();
         errors.note(self.settle(id, Some(live), settle));
-    }
-
-    /// Hand `envelope` to `live`, task `id`, or refuse it if it was written for another task
-    /// type. Either way the envelope is used up; the task is untouched by a refusal. A panic in
-    /// the message's `deliver` (or in its drop, once refused) is caught and returned as the
-    /// error, as an `Err` from `deliver` is: only this message is lost, and the task goes on.
-    fn deliver(id: TaskId, live: &mut ProtocolTaskPtr, envelope: EnvelopePacket) -> Result<(), String> {
-        let kind = envelope.kind();
-        catch(move || {
-            if envelope.target_type() != live.task_type_id() {
-                return Err(format!(
-                    "envelope {:?} for task {:?} targets another task type than {}",
-                    kind,
-                    id,
-                    live.vtable().type_name()
-                ));
-            }
-            // SAFETY: the envelope targets exactly the type `live` holds (checked above), and
-            // `live` is out of its row, so this access is exclusive; `raw_data` itself has no
-            // requirement beyond that use.
-            unsafe { envelope.dispatch(live.raw_data()) }
-        })
-        .unwrap_or_else(|text| Err(format!("message {kind:?} for task {id:?} panicked: {text}")))
     }
 
     /// Carry out `settle` on task `id` from outside a poll: a message, or Shutdown.
@@ -992,7 +1012,7 @@ impl<S: CheckpointStore> WakerProtocol<S> {
             errors.note(free(id, live));
         }
         for envelope in mailbox {
-            errors.note(drop_message(id, envelope));
+            errors.note(deliver_or_drop(id, None, envelope));
         }
         errors.note(Self::prune(&self.store, &mut checkpoint_history, keep));
         errors.finish()

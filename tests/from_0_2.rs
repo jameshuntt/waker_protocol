@@ -1,17 +1,21 @@
-//! What 0.3.0 removed from 0.2.0 and 0.3.2 puts back. Each test uses one item put back; none of
-//! them compiles against 0.3.1. Tasks count their drops in a thread-local, so a task freed twice
-//! or never fails here, and Miri reports any leak or bad read.
+//! What 0.3.0 removed from 0.2.0 and 0.3.2 puts back, and the differences from 0.2.0 the README
+//! names. Every item put back is used by a test here, so the file does not compile against 0.3.1.
+//! The Debug test checks the output the README describes (it uses only items public since 0.3.0),
+//! the waker test that `TASK_WAKE_SIGNAL_RAW_VTABLE` is a copy the crate's wakers do not carry,
+//! and the derive test that `derive_protocol_task_vtable!` calls the trait's functions. Tasks
+//! count their drops in a thread-local, so a task freed twice or never fails here, and Miri
+//! reports any leak or bad read.
 
 use std::cell::Cell;
 use std::sync::Arc;
 use std::task::{RawWaker, Waker};
 
 use waker_protocol::{
-    derive_protocol_task_vtable, CheckpointReason, MemoryCheckpointStore, ProtocolTask, ProtocolTaskPtr,
-    ProtocolVTable, Resident, TaskPoll, TaskPolicy, TaskWakeSignal, WakeReason, WakerProtocol,
-    TASK_WAKE_SIGNAL_RAW_VTABLE,
+    derive_protocol_task_vtable, scheduler_waker, CheckpointReason, CheckpointStore, MemoryCheckpointStore,
+    ProtocolTask, ProtocolTaskPtr, ProtocolVTable, Resident, TaskId, TaskPoll, TaskPolicy, TaskWakeSignal,
+    WakeReason, WakerProtocol, TASK_WAKE_SIGNAL_RAW_VTABLE,
 };
-use waker_tables::VTableKey;
+use waker_tables::{UnsafeWakeable, VTableKey};
 
 thread_local! {
     static DROPS: Cell<usize> = const { Cell::new(0) };
@@ -234,4 +238,122 @@ fn debug_output_shows_the_full_type_path() {
     let shown = format!("{task:?}");
     assert!(shown.starts_with("ProtocolTaskPtr { data: "), "{shown}");
     assert!(shown.ends_with(", type_name: \"from_0_2::Job\" }"), "{shown}");
+}
+
+#[test]
+fn the_raw_waker_vtable_static_is_a_copy_the_crates_wakers_do_not_carry() {
+    let sched = scheduler();
+    let id = TaskId::new(0, 0);
+    let carried = <TaskWakeSignal as UnsafeWakeable>::raw_waker_vtable();
+    assert!(!std::ptr::eq(carried, &TASK_WAKE_SIGNAL_RAW_VTABLE), "the static is a copy at its own address");
+
+    // A waker from `scheduler_waker` and its clone carry the derive's static, and wake each other.
+    let made = scheduler_waker(id, sched.sender(), WakeReason::Timer);
+    let clone = made.clone();
+    assert!(std::ptr::eq(made.vtable(), carried) && std::ptr::eq(clone.vtable(), carried));
+    assert!(!std::ptr::eq(made.vtable(), &TASK_WAKE_SIGNAL_RAW_VTABLE), "not the static, unlike 0.2.0");
+    assert!(clone.will_wake(&made));
+
+    // A waker built on the static: its clone carries the derive's static, so the two do not
+    // `will_wake` each other (in 0.2.0 they did).
+    let signal = Arc::new(TaskWakeSignal { id, tx: sched.sender(), reason: WakeReason::Timer });
+    let data = Arc::into_raw(signal.clone()) as *const ();
+    // SAFETY: `data` owns one strong ref of an `Arc<TaskWakeSignal>`, as the vtable's functions
+    // read it, and the waker gives it back when dropped.
+    let built = unsafe { Waker::from_raw(RawWaker::new(data, &TASK_WAKE_SIGNAL_RAW_VTABLE)) };
+    let built_clone = built.clone();
+    assert!(std::ptr::eq(built.vtable(), &TASK_WAKE_SIGNAL_RAW_VTABLE));
+    assert!(std::ptr::eq(built_clone.vtable(), carried), "its clone carries the derive's static");
+    assert!(!built_clone.will_wake(&built));
+    drop((built, built_clone));
+    assert_eq!(Arc::strong_count(&signal), 1, "every ref the wakers held is given back");
+}
+
+/// Reads a `Job`'s poll count through `&WakerProtocol`, as 0.2.0 code read `p.data`.
+fn polls_seen<S: CheckpointStore>(sched: &WakerProtocol<S>, id: TaskId) -> Option<u32> {
+    match &sched.tasks.get(id)?.resident {
+        Resident::Live(p) if p.vtable().is_for::<Job>() => {
+            // SAFETY: the task is a live `Job` (checked above), only read here, while nothing
+            // else uses it.
+            Some(unsafe { (*(p.data() as *const Job)).polls })
+        }
+        _ => None,
+    }
+}
+
+#[test]
+fn data_reads_the_task_pointer_through_a_shared_reference() {
+    let mut sched = scheduler();
+    let before = drops();
+    let h = sched.spawn_box(JOB, Job::boxed(), TaskPolicy::default()).unwrap();
+    sched.run_once().unwrap();
+    h.wake(WakeReason::Manual).unwrap();
+    sched.run_once().unwrap();
+    assert_eq!(polls_seen(&sched, h.id()), Some(2));
+
+    let mut task = ProtocolTaskPtr::from_box(Job::boxed(), &JOB_VTABLE);
+    // SAFETY: the call itself has no requirement.
+    let raw = unsafe { task.raw_data() };
+    assert_eq!(task.data(), raw, "the same pointer `raw_data` gives");
+    drop(task);
+    drop(sched);
+    assert_eq!(drops() - before, 2, "each task freed once, by its owner");
+}
+
+thread_local! {
+    static RAN: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Has inherent `cleanup` and `footprint_estimate` methods named like the trait's, as a 0.2.0
+/// task could, whose 0.2.0 vtable called them in place of the trait's.
+struct Shadowed {
+    big: Vec<u8>,
+}
+
+impl Shadowed {
+    fn cleanup(&mut self) {
+        RAN.with(|r| r.borrow_mut().push("inherent cleanup"));
+    }
+
+    fn footprint_estimate(&self) -> usize {
+        self.big.len()
+    }
+}
+
+// SAFETY: the functions only touch `self`.
+unsafe impl ProtocolTask for Shadowed {
+    unsafe fn poll(&mut self) -> TaskPoll {
+        TaskPoll::Pending
+    }
+
+    unsafe fn checkpoint(&mut self) -> Vec<u8> {
+        Vec::new()
+    }
+
+    unsafe fn restore(_: &[u8]) -> Self {
+        Self { big: Vec::new() }
+    }
+
+    unsafe fn cleanup(&mut self) {
+        RAN.with(|r| r.borrow_mut().push("trait cleanup"));
+    }
+
+    fn footprint_estimate(&self) -> usize {
+        7
+    }
+}
+
+derive_protocol_task_vtable!(Shadowed, SHADOWED_VTABLE);
+
+#[test]
+fn derive_protocol_task_vtable_calls_the_trait_functions_not_inherent_methods_of_the_same_name() {
+    let mut direct = Shadowed { big: vec![0; 100] };
+    direct.cleanup();
+    assert_eq!(direct.footprint_estimate(), 100, "method syntax on the type reaches the inherent methods");
+    RAN.with(|r| r.borrow_mut().clear());
+
+    let task = ProtocolTaskPtr::from_box(Box::new(direct), &SHADOWED_VTABLE);
+    assert_eq!(task.footprint_estimate(), 7, "the vtable calls the trait's footprint_estimate");
+    drop(task);
+    assert_eq!(RAN.with(|r| r.borrow().clone()), ["trait cleanup"], "and the trait's cleanup");
 }

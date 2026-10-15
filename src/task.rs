@@ -21,9 +21,13 @@ use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 /// If `cleanup` or the task's own `Drop` panics while `run_once` or `pump` frees the task (at its
 /// end, or once its checkpoint is saved), the scheduler catches that too: the task is freed anyway,
 /// its row is left as it would have been (removed, or dormant after a checkpoint), and the panic
-/// is returned as an error once the round is done. If both panic, the task is still freed and the
-/// error names the panic from `cleanup`. Dropping the scheduler itself drops its live tasks as any
-/// value is dropped: a panic there goes to the code that drops the scheduler.
+/// is returned as an error once the round is done. With a vtable from [`ProtocolVTable::of`] or
+/// [`derive_protocol_task_vtable!`](crate::derive_protocol_task_vtable), if both panic, the task
+/// is still freed and the error names the panic from `cleanup`. A vtable from
+/// [`ProtocolVTable::from_raw_parts`] does that only if its destroy function holds a `cleanup`
+/// panic until the task is dropped; otherwise a panic in both aborts the process. Dropping the
+/// scheduler itself drops its live tasks as any value is dropped: a panic there goes to the code
+/// that drops the scheduler.
 pub unsafe trait ProtocolTask: Send + Sync + 'static {
     /// Advance the task.
     ///
@@ -52,7 +56,9 @@ pub unsafe trait ProtocolTask: Send + Sync + 'static {
         Self: Sized;
 
     /// Runs just before the task is freed. If it panics, the task is still dropped and freed, and
-    /// the panic goes on after that.
+    /// the panic goes on after that, with a vtable from [`ProtocolVTable::of`] or
+    /// `derive_protocol_task_vtable!`; [`ProtocolVTable::from_raw_parts`] says what a hand-written
+    /// destroy function must do for the same.
     ///
     /// # Safety
     /// As `poll`.
@@ -207,6 +213,13 @@ impl ProtocolVTable {
     /// assert_eq!(unsafe { task.poll() }, TaskPoll::Ready);
     /// ```
     ///
+    /// A `destroy_fn` that calls the task's `cleanup` must hold a panic from `cleanup` until the
+    /// task is dropped, as the destroy function of [`of`](Self::of) does: it runs `cleanup` under
+    /// `catch_unwind`, drops the task, and only then lets the panic go on. A `destroy_fn` that
+    /// drops the task while a `cleanup` panic unwinds, as 0.2.0's `derive_protocol_task_vtable!`
+    /// wrote it (`let mut b = Box::from_raw(..); b.cleanup();`), aborts the process when the
+    /// task's own drop panics as well.
+    ///
     /// # Safety
     /// The vtable records `T` as its task type, and the crate trusts that:
     /// [`WakerProtocol::spawn_box`](crate::WakerProtocol::spawn_box) and
@@ -309,7 +322,9 @@ impl fmt::Debug for ProtocolVTable {
 ///
 /// The fields are private, so the pointer and the vtable always belong to the same type; the one
 /// way to pair them by hand is the `unsafe` [`from_raw_parts`](Self::from_raw_parts). Safe code
-/// can neither pair them nor reach the pointer:
+/// can read the pointer with [`data`](Self::data), as it could read 0.2.0's public field, but
+/// using the pointer takes `unsafe`. Safe code cannot pair them, and [`raw_data`](Self::raw_data)
+/// is an `unsafe fn`, as in 0.2.0:
 ///
 /// ```compile_fail,E0451
 /// # use waker_protocol::{ProtocolTaskPtr, ProtocolVTable};
@@ -402,8 +417,36 @@ impl ProtocolTaskPtr {
         unsafe { (self.vtable.footprint_fn)(self.data as *const ()) }
     }
 
-    /// The raw task pointer, as [`Envelope::dispatch`](crate::Envelope::dispatch) takes it. The
-    /// task stays owned by this `ProtocolTaskPtr`.
+    /// The raw task pointer, read through a shared reference, as 0.2.0's public `data` field could
+    /// be. The task stays owned by this `ProtocolTaskPtr`. Reading the pointer is safe; using it is
+    /// `unsafe`, under the rules [`raw_data`](Self::raw_data) states.
+    ///
+    /// ```
+    /// # use waker_protocol::{derive_protocol_task_vtable, ProtocolTask, ProtocolTaskPtr, TaskPoll};
+    /// struct Job { polls: u32 }
+    /// # unsafe impl ProtocolTask for Job {
+    /// #     unsafe fn poll(&mut self) -> TaskPoll { self.polls += 1; TaskPoll::Pending }
+    /// #     unsafe fn checkpoint(&mut self) -> Vec<u8> { Vec::new() }
+    /// #     unsafe fn restore(_: &[u8]) -> Self { Job { polls: 0 } }
+    /// # }
+    /// derive_protocol_task_vtable!(Job, JOB_VTABLE);
+    ///
+    /// fn polls(task: &ProtocolTaskPtr) -> u32 {
+    ///     assert!(task.vtable().is_for::<Job>());
+    ///     // SAFETY: the task is a live `Job` (checked above), only read here while nothing writes it.
+    ///     unsafe { (*(task.data() as *const Job)).polls }
+    /// }
+    ///
+    /// let task = ProtocolTaskPtr::from_box(Box::new(Job { polls: 3 }), &JOB_VTABLE);
+    /// assert_eq!(polls(&task), 3);
+    /// ```
+    pub fn data(&self) -> *mut () {
+        self.data
+    }
+
+    /// The raw task pointer, as [`Envelope::dispatch`](crate::Envelope::dispatch) takes it: the
+    /// same pointer [`data`](Self::data) reads, with 0.2.0's signature. The task stays owned by
+    /// this `ProtocolTaskPtr`.
     ///
     /// # Safety
     /// The call itself has no requirement. Using the pointer does: it points to the live task, a

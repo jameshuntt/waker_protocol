@@ -1,7 +1,7 @@
 //! The docs say what the code does. Each test below checks a sentence a review of 0.3.0, 0.3.1 or
 //! the 0.3.2 draft found false, or a sentence 0.3.2 adds: the old wording, if any, is gone and the
-//! new wording is there. The test named in each comment, in tests/scheduler.rs, tests/from_0_2.rs
-//! or src/slab.rs, proves the new wording against the code.
+//! new wording is there. The test named in each comment, in tests/scheduler.rs, tests/from_0_2.rs,
+//! src/slab.rs or a doctest, proves the new wording against the code.
 
 const SCHEDULER: &str = include_str!("../src/scheduler.rs");
 const POLICY: &str = include_str!("../src/policy.rs");
@@ -9,7 +9,9 @@ const TYPES: &str = include_str!("../src/types.rs");
 const SLAB: &str = include_str!("../src/slab.rs");
 const CAPITULATE: &str = include_str!("../src/capitulate.rs");
 const TASK: &str = include_str!("../src/task.rs");
+const WAKE_REF: &str = include_str!("../src/wake_ref.rs");
 const README: &str = include_str!("../readme.md");
+const FROM_0_2: &str = include_str!("from_0_2.rs");
 
 const DOC_CLAIMS: &str = include_str!("doc_claims.rs");
 
@@ -154,8 +156,8 @@ fn the_docs_say_what_a_panic_in_deliver_cleanup_or_drop_does() {
     says(README, old_heading, "**A panic in `cleanup` or in a task's `Drop` is an error, not a stop.**");
     says(README, old_heading, "**A panic in `poll`, `on_wake`, `checkpoint`, `restore` or `footprint_estimate` ends only\n  that task.**");
     says(SCHEDULER, "If `deliver` returns `Err`, only this message is lost", "If `deliver` returns `Err` or panics, only this message is lost");
-    tells(SCHEDULER, "is caught and treated as a `deliver` that returned `Err`");
-    tells(SCHEDULER, "A panic in a task's `cleanup` or `Drop`, or in the drop of a message queued for a");
+    tells(SCHEDULER, "is caught and treated as a `deliver` that\n    /// returned `Err`");
+    tells(SCHEDULER, "A panic in a task's `cleanup` or `Drop` is caught as the task\n    /// is freed");
     says(TASK, "/// Runs just before the task is freed.\n", "Runs just before the task is freed. If it panics, the task is still dropped and freed");
     tells(TASK, "If `cleanup` or the task's own `Drop` panics while `run_once` or `pump` frees the task");
 }
@@ -183,15 +185,115 @@ fn the_docs_say_the_store_removes_checkpoints_only_once_the_task_is_freed() {
 /// `debug_output_shows_the_full_type_path`.
 #[test]
 fn the_readme_lists_what_came_back_from_0_2_0_and_the_debug_output() {
-    tells(README, "**Put back from 0.2.0.** 0.3.0 removed these, and its notes did not say so.");
+    tells(README, "**Put back from 0.2.0.** 0.3.0 removed these.");
     tells(README, "`TASK_WAKE_SIGNAL_RAW_VTABLE`, the raw waker vtable of `TaskWakeSignal`");
     tells(README, "`ProtocolTaskPtr::raw_data(&mut self) -> *mut ()`, public again and `unsafe`, as in 0.2.0.");
     tells(README, "`ProtocolVTable::from_raw_parts::<T>(..)`, an `unsafe const fn`");
-    tells(README, "`ProtocolTaskPtr::from_raw_parts(data, vtable)`, an\n    `unsafe fn`");
+    tells(README, "`ProtocolTaskPtr::from_raw_parts(data, vtable)`, an `unsafe fn`");
     tells(README, "**Debug output names the type by its full path.**");
     says(
         README,
         "No public signature changed; `WakerProtocol` has one new public\nfield, `finished`.",
-        "New public items: the field\n`WakerProtocol::finished`, and the 0.2.0 items listed under **Put back from 0.2.0**.",
+        "New public items: the field\n`WakerProtocol::finished`, and the items listed under **Put back from 0.2.0**, except\n`type_name()` and `vtable()`, which are public since 0.3.0.",
     );
+}
+
+/// Proved by `a_panic_in_a_messages_kind_or_target_type_loses_only_that_message_and_never_aborts`,
+/// `a_panic_in_kind_at_a_tasks_end_still_frees_everything_and_removes_its_checkpoints` and
+/// `a_message_whose_drop_panics_sent_to_a_task_already_ended_is_an_error_for_the_round`.
+#[test]
+fn the_docs_say_a_panic_in_kind_or_target_type_or_in_a_message_for_an_ended_task_is_caught() {
+    says(
+        SCHEDULER,
+        "or in the drop of a message queued for a\n    /// task that is ending, is caught",
+        "So is a panic in\n    /// the drop of a message that is not delivered: one queued for a task that ends, one sent to a\n    /// task that has already ended, or one refused.",
+    );
+    tells(SCHEDULER, "in a message's `deliver`, or in the `kind` or `target_type` of an");
+    says(
+        SCHEDULER,
+        "A message whose `dispatch` panics is dropped the same way.",
+        "A message whose `kind`, `target_type` or `dispatch` panics is lost the\n    /// same way, with the panic as the error. A message sent to a task that has already ended is\n    /// dropped",
+    );
+    tells(README, "The same holds for a panic in the `kind` or `target_type` of an\n  `Envelope` written by hand");
+    says(
+        README,
+        "So is a panic in the drop of a message still queued for a task\n  that ends.",
+        "So is a panic in the drop of a message that is not delivered:\n  one still queued for a task that ends, one sent to a task that has already ended, or one\n  refused.",
+    );
+}
+
+/// Proved by `the_raw_waker_vtable_static_is_a_copy_the_crates_wakers_do_not_carry`.
+#[test]
+fn the_docs_say_the_raw_waker_vtable_static_is_a_copy_the_crates_wakers_do_not_carry() {
+    says(
+        WAKE_REF,
+        "[`scheduler_waker`] builds its waker from the same four functions.",
+        "Unlike 0.2.0, it is a copy at its own address, not the vtable the crate's wakers carry.",
+    );
+    tells(WAKE_REF, "a waker built on this static does not `will_wake` its own clone");
+    tells(README, "It is back as a copy at its own address, not as the vtable the crate's wakers\n    carry, which it was in 0.2.0.");
+    tells(README, "a waker built on it does not `will_wake` its own clone; in 0.2.0\n    both were true.");
+}
+
+/// Proved by `a_panic_in_cleanup_or_drop_is_an_error_for_the_round_and_the_round_goes_on` (a
+/// vtable from `derive_protocol_task_vtable!`); a probe with the 0.2.0-style destroy function of
+/// tests/from_0_2.rs, whose `cleanup` and `Drop` both panic, aborts.
+#[test]
+fn the_double_panic_claim_names_the_vtables_it_holds_for() {
+    says(
+        TASK,
+        "is returned as an error once the round is done. If both panic, the task is still freed",
+        "With a vtable from [`ProtocolVTable::of`] or\n/// [`derive_protocol_task_vtable!`](crate::derive_protocol_task_vtable), if both panic, the task\n/// is still freed",
+    );
+    tells(TASK, "otherwise a panic in both aborts the process.");
+    tells(TASK, "A `destroy_fn` that calls the task's `cleanup` must hold a panic from `cleanup` until the\n    /// task is dropped");
+    says(
+        README,
+        "so a panic in the drop as well no longer aborts the process; that holds\n  wherever a `ProtocolTaskPtr` is dropped.",
+        "that holds wherever a\n  `ProtocolTaskPtr` with such a vtable is dropped.",
+    );
+    tells(README, "still aborts when\n  both panic.");
+}
+
+/// The 0.3.0 notes named the private fields, and `type_name()` was public in 0.3.0 (its
+/// published task.rs has `pub fn type_name(&self)`).
+#[test]
+fn the_put_back_notes_say_what_0_3_0_named_and_that_type_name_is_older() {
+    says(
+        README,
+        "0.3.0 removed these, and its notes did not say so.",
+        "Its notes said the fields of `ProtocolVTable`\n  and `ProtocolTaskPtr` became private, but not that reading them or building from parts went\n  with the fields, and they did not mention `TASK_WAKE_SIGNAL_RAW_VTABLE` or `raw_data` at all.",
+    );
+    says(
+        README,
+        "and `type_name()` reads the\n    name.",
+        "`type_name()`, which reads the type's name, has been\n    public since 0.3.0.",
+    );
+}
+
+/// tests/from_0_2.rs's Debug test uses only items public since 0.3.0, so it compiles against
+/// 0.3.1 on its own.
+#[test]
+fn the_from_0_2_header_says_what_its_tests_check() {
+    says(
+        FROM_0_2,
+        "Each test uses one item put back; none of\n//! them compiles against 0.3.1.",
+        "Every item put back is used by a test here, so the file does not compile against 0.3.1.",
+    );
+    tells(FROM_0_2, "The Debug test checks the output the README describes");
+}
+
+/// Proved by `data_reads_the_task_pointer_through_a_shared_reference` and the doctest on
+/// `ProtocolTaskPtr::data`.
+#[test]
+fn the_docs_say_the_task_pointer_can_be_read_through_a_shared_reference() {
+    tells(README, "`ProtocolTaskPtr::data(&self) -> *mut ()` reads the task\n    pointer through a shared reference, as `p.data` did");
+    says(TASK, "Safe code\n/// can neither pair them nor reach the pointer:", "Safe code\n/// can read the pointer with [`data`](Self::data), as it could read 0.2.0's public field, but\n/// using the pointer takes `unsafe`.");
+}
+
+/// Proved by `derive_protocol_task_vtable_calls_the_trait_functions_not_inherent_methods_of_the_same_name`.
+#[test]
+fn the_readme_says_the_derive_calls_the_trait_functions() {
+    tells(README, "**`derive_protocol_task_vtable!` calls the `ProtocolTask` functions.**");
+    tells(README, "so an inherent method of the same name, when the type had one, ran in\n  place of the trait's.");
 }

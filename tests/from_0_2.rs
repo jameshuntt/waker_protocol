@@ -2,7 +2,8 @@
 //! names. Every item put back is used by a test here, so the file does not compile against 0.3.1.
 //! The Debug test checks the output the README describes (it uses only items public since 0.3.0),
 //! the waker test that `TASK_WAKE_SIGNAL_RAW_VTABLE` is a copy the crate's wakers do not carry,
-//! and the derive test that `derive_protocol_task_vtable!` calls the trait's functions. Tasks
+//! the empty-pointer test that a `ProtocolTaskPtr` with a null `data` owns nothing, and the
+//! derive test that `derive_protocol_task_vtable!` calls the trait's functions. Tasks
 //! count their drops in a thread-local, so a task freed twice or never fails here, and Miri
 //! reports any leak or bad read.
 
@@ -358,4 +359,41 @@ fn derive_protocol_task_vtable_calls_the_trait_functions_not_inherent_methods_of
     assert_eq!(task.footprint_estimate(), 7, "the vtable calls the trait's footprint_estimate");
     drop(task);
     assert_eq!(RAN.with(|r| r.borrow().clone()), ["trait cleanup"], "and the trait's cleanup");
+}
+
+/// Holds a task the way 0.2.0 code could: in a field, emptied by moving the task out.
+struct Holder {
+    slot: ProtocolTaskPtr,
+}
+
+/// An empty pointer for `vtable`: a null `data`, owning nothing.
+fn empty(vtable: &'static ProtocolVTable) -> ProtocolTaskPtr {
+    // SAFETY: a null `data` makes an empty pointer; the callers only read it, move it and drop
+    // it, and never poll, wake, checkpoint, restore into it or put it in a task row.
+    unsafe { ProtocolTaskPtr::from_raw_parts(std::ptr::null_mut(), vtable) }
+}
+
+/// 0.2.0's `ProtocolTaskPtr { data: null_mut(), vtable }`, whose drop skipped the null `data`.
+#[test]
+fn an_empty_task_pointer_owns_nothing_and_dropping_it_does_nothing() {
+    let before = (drops(), hand_calls());
+    for vtable in [&JOB_VTABLE, &HAND_VTABLE] {
+        let none = empty(vtable);
+        assert!(none.data().is_null());
+        assert_eq!(none.footprint_estimate(), 0, "the safe footprint of an empty pointer is 0");
+        drop(none);
+    }
+    assert_eq!((drops(), hand_calls()), before, "no function of the vtable ran, and nothing was freed");
+
+    // As 0.2.0 code did: move the task out of a slot and leave an empty pointer in its place.
+    let mut holder = Holder { slot: ProtocolTaskPtr::from_box(Job::boxed(), &HAND_VTABLE) };
+    let mut taken = std::mem::replace(&mut holder.slot, empty(&HAND_VTABLE));
+    // SAFETY: `taken` owns a live `Job`, and `&mut` gives exclusive access.
+    assert_eq!(unsafe { taken.poll() }, TaskPoll::Pending);
+    drop(taken);
+    assert_eq!(drops() - before.0, 1, "the task moved out is freed once");
+    assert!(holder.slot.data().is_null());
+    drop(holder);
+    assert_eq!(drops() - before.0, 1, "the empty slot frees nothing");
+    assert_eq!(hand_calls() - before.1, 2, "only the poll and the destroy of the task moved out ran");
 }

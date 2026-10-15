@@ -304,30 +304,51 @@ fn the_readme_says_the_derive_calls_the_trait_functions() {
 // The fifth review of the 0.3.2 draft.
 
 /// Proved by `an_over_budget_task_keeps_the_poll_for_its_yield_when_a_qos_or_memory_pressure_wake_follows`,
-/// `an_over_budget_task_that_yields_runs_to_the_end_without_a_wake` and, for a task without
-/// `eager_repoll_after_yield`, `yield_runs_again_next_round_when_eager_and_waits_for_a_wake_when_not`.
+/// `an_over_budget_task_that_yields_runs_to_the_end_without_a_wake` and
+/// `a_yield_already_polled_for_gives_no_poll_to_a_later_qos_or_memory_pressure_wake`; for a task
+/// without `eager_repoll_after_yield`, by `without_eager_repoll_a_yield_parks_and_is_owed_no_poll`.
 #[test]
 fn the_strategy_docs_say_a_yield_keeps_its_poll_whatever_wakes_come_after_it() {
     let old = "or a `Yield` and no wake since";
     says(CAPITULATE, old, "or a `Yield` it has not been polled for, whatever wakes came after it; a\n/// `Yield` counts only with `eager_repoll_after_yield`");
     says(README, old, "or a `Yield` it has not been polled for, whatever wakes came after it),");
     tells(README, "A `Yield`\n  counts only with `eager_repoll_after_yield` (the default)");
-    says(SCHEDULER, "with\n    /// nothing waiting, a runnable state (it yielded)", "or a `Yield`\n    /// it has not been polled for since (`yielded`), whatever wakes came after it.");
+    says(
+        SCHEDULER,
+        "with\n    /// nothing waiting, a runnable state (it yielded)",
+        "or a poll it\n    /// is `owed` (work it was handed, or a `Yield`, it has not been polled for since), whatever\n    /// wakes came after it.",
+    );
     tells(POLICY, "A `Yield` keeps its poll even when a `QoS` or\n    /// `MemoryPressure` wake comes after it, and counts only with `eager_repoll_after_yield`.");
 }
 
 /// A probe that drops a `ProtocolTaskPtr` of `derive_protocol_task_vtable!` whose `cleanup` and
 /// `Drop` both panic: dropped on its own, the panic is caught; dropped while another panic
-/// unwinds, the process aborts.
+/// unwinds, the process aborts (an abort cannot be caught in a test). The sixth review found that
+/// this does not hold "whatever its vtable":
+/// `a_destroy_function_that_holds_the_panics_keeps_a_drop_during_an_unwind_from_aborting` drops
+/// such a task, with a destroy function that holds both panics, while another panic unwinds.
 #[test]
 fn the_double_panic_claim_says_a_drop_during_an_unwind_still_aborts() {
     says(
         README,
         "that holds wherever a\n  `ProtocolTaskPtr` with such a vtable is dropped. ",
-        "A `ProtocolTaskPtr` dropped while another panic\n  unwinds (by a scheduler dropped during a panic, say) aborts the process if its `cleanup` or its\n  drop panics, whatever its vtable",
+        "a `ProtocolTaskPtr` dropped while another panic unwinds (by a scheduler dropped during a\n  panic, say) aborts the process if its `cleanup` or its drop panics",
     );
-    tells(TASK, "A task dropped while another panic unwinds (a scheduler dropped\n/// during a panic, say) aborts the process if its `cleanup` or its `Drop` panics");
-    tells(TASK, "Dropped\n/// while another panic unwinds, it aborts the process if its `cleanup` or the task's drop panics");
+    says(
+        README,
+        "drop panics, whatever its vtable",
+        "With a vtable from `ProtocolVTable::of` or\n  `derive_protocol_task_vtable!`, or any destroy function that lets a `cleanup` or drop panic go\n  on, a `ProtocolTaskPtr` dropped while another panic unwinds",
+    );
+    says(
+        TASK,
+        "`Drop` panics, whatever its\n/// vtable",
+        "With a vtable from [`ProtocolVTable::of`] or\n/// `derive_protocol_task_vtable!`, or any destroy function that lets a `cleanup` or drop panic go\n/// on, a task dropped while another panic unwinds (a scheduler dropped during a panic, say)\n/// aborts the process if its `cleanup` or its `Drop` panics",
+    );
+    says(
+        TASK,
+        "Dropped\n/// while another panic unwinds, it aborts the process",
+        "With such a\n/// vtable, or any destroy function that lets a `cleanup` or drop panic go on, a `ProtocolTaskPtr`\n/// dropped while another panic unwinds aborts the process if its `cleanup` or the task's drop\n/// panics",
+    );
 }
 
 /// Proved by `debug_output_shows_the_full_type_path` (a vtable from `from_raw_parts` included)
@@ -366,4 +387,49 @@ fn the_docs_say_from_box_drops_a_task_it_refuses_before_it_panics() {
     );
     tells(README, "**`ProtocolTaskPtr::from_box` drops a task it refuses before it panics.**");
     tells(README, "In 0.3.0 and 0.3.1 it panicked first and dropped the task while that panic\n  unwound, so a task whose drop panicked aborted the process.");
+}
+
+// The sixth review of the 0.3.2 draft.
+
+/// Proved by `work_handed_to_a_task_keeps_its_poll_when_the_save_of_a_strategy_checkpoint_fails_or_panics`
+/// and `work_handed_to_a_task_keeps_its_poll_when_the_strategy_panics`.
+#[test]
+fn the_docs_say_work_a_task_was_handed_keeps_its_poll_when_a_save_fails_or_the_strategy_panics() {
+    tells(README, "Work the task was handed keeps its poll even when the\n  save of the strategy's checkpoint fails or the strategy panics");
+    tells(CAPITULATE, "Work the task was handed keeps its\n/// poll even when the save of the plan's checkpoint fails or the strategy panics");
+    says(SCHEDULER, "/// Tasks that yielded and have not been polled since.", "/// Tasks owed a poll: each was handed work");
+}
+
+/// Proved by `a_task_the_strategy_checkpointed_without_auto_restore_is_polled_once_auto_restore_is_back`.
+#[test]
+fn the_docs_say_a_task_the_strategy_checkpointed_waits_for_auto_restore() {
+    says(
+        README,
+        "the next round restores it and polls it. So an",
+        "the next round restores it and polls it (with\n  `auto_restore_on_wake` on; with it off, once it is set back to true).",
+    );
+    says(
+        CAPITULATE,
+        "round restores and polls it, so the plan",
+        "round restores and polls it (with `auto_restore_on_wake` on; with it off, once it is set back\n/// to true)",
+    );
+}
+
+/// Proved by `an_empty_task_pointer_owns_nothing_and_dropping_it_does_nothing`, which Miri runs too.
+#[test]
+fn the_docs_say_an_empty_task_pointer_is_back() {
+    tells(README, "  - The empty `ProtocolTaskPtr`. In 0.2.0 a `ProtocolTaskPtr` whose `data` was null owned");
+    tells(README, "`poll`, `on_wake`, `checkpoint`\n    and `raw_data` require a non-null `data`.");
+    tells(TASK, "Or `data` is null, for an empty pointer that owns nothing, as 0.2.0's could be");
+    tells(TASK, "ProtocolTask's contract for `poll`, and a non-null `data`");
+    tells(TASK, "Using the pointer does: it requires a non-null `data`");
+    says(TASK, "/// The task's own size estimate.\n", "/// The task's own size estimate; 0 for an empty pointer (a null `data`)");
+}
+
+/// Proved by the `compile_fail` doctest on `ProtocolVTable::type_name`.
+#[test]
+fn the_put_back_notes_say_type_name_reads_the_name_at_run_time_only() {
+    tells(README, "`type_name()` reads the name at run time only, because `std::any::type_name` is not `const`\n    on stable");
+    tells(README, "a name needed in a\n    `static` now has to be written out by hand.");
+    tells(TASK, "It is read at run time only: `std::any::type_name` is not `const` on stable");
 }

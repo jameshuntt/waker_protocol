@@ -68,15 +68,18 @@ back. No public signature changed. New public items: the field
 - **A strategy checkpoint puts a poll off; it never drops it.** When the strategy checkpoints a
   task instead of polling it, and the task had work waiting (a message, a wake other than `QoS`
   or `MemoryPressure`, or a `Yield` it has not been polled for, whatever wakes came after it),
-  the task stays runnable while dormant: the next round restores it and polls it. So an
+  the task stays runnable while dormant: the next round restores it and polls it (with
+  `auto_restore_on_wake` on; with it off, once it is set back to true). So an
   over-budget Batch task gets one poll for every message, every wake other than `QoS` or
   `MemoryPressure`, and every `Yield`, a round later than a task within its budget. A `Yield`
   counts only with `eager_repoll_after_yield` (the default); without it, a task that yields waits
-  for a wake, within its budget or not. A task woken only by `QoS` or `MemoryPressure` gets no
-  poll for that wake: its `on_wake` hears it, the checkpoint answers it, and the task stays
-  dormant until its next wake or message, so a memory-pressure reclaim is not undone the round
-  after. In 0.3.1 such a task was left dormant with its work delivered but not acted on, until
-  another wake; a task that yielded and was checkpointed this way never ran again.
+  for a wake, within its budget or not. Work the task was handed keeps its poll even when the
+  save of the strategy's checkpoint fails or the strategy panics: the task is owed the poll until
+  one runs, so the next strategy checkpoint keeps it runnable too. A task woken only by `QoS` or
+  `MemoryPressure` gets no poll for that wake: its `on_wake` hears it, the checkpoint answers it,
+  and the task stays dormant until its next wake or message, so a memory-pressure reclaim is not
+  undone the round after. In 0.3.1 such a task was left dormant with its work delivered but not
+  acted on, until another wake; a task that yielded and was checkpointed this way never ran again.
 - **A dormant task without auto-restore stays dormant.** With `auto_restore_on_wake` off, a wake
   or a message sent to a dormant task is kept in its row (`pending_wakes`, `mailbox`), and the
   task stays `Dormant` and out of the ready list. Set `auto_restore_on_wake` back to true in its
@@ -122,15 +125,17 @@ back. No public signature changed. New public items: the field
   `ProtocolTaskPtr` with such a vtable is dropped outside an unwind. A vtable from
   `ProtocolVTable::from_raw_parts` gets the same only if its destroy function holds a `cleanup`
   panic until the task is dropped; one written as 0.2.0's macro wrote it (`Box::from_raw`, then
-  `cleanup()`) still aborts when both panic. A `ProtocolTaskPtr` dropped while another panic
-  unwinds (by a scheduler dropped during a panic, say) aborts the process if its `cleanup` or its
-  drop panics, whatever its vtable, as any value whose drop panics during an unwind does. In
-  0.3.1 a panic in `cleanup` or `Drop` reached the caller and left the task's row as
-  `Resident::Empty` for good (after a checkpoint, with the saved checkpoint left out of the
-  task's history); a panic in a queued message's drop reached the caller with the row removed
-  and the task's checkpoints left in the store; a panic in the drop of a message sent to a task
-  that had ended reached the caller, and the round's other errors and the rest of the round were
-  lost; a panic in the drop of a refused message reached the caller and left the task's row as
+  `cleanup()`) still aborts when both panic. With a vtable from `ProtocolVTable::of` or
+  `derive_protocol_task_vtable!`, or any destroy function that lets a `cleanup` or drop panic go
+  on, a `ProtocolTaskPtr` dropped while another panic unwinds (by a scheduler dropped during a
+  panic, say) aborts the process if its `cleanup` or its drop panics, as any value whose drop
+  panics during an unwind does. In 0.3.1 a panic in `cleanup` or `Drop` reached the caller and
+  left the task's row as `Resident::Empty` for good (after a checkpoint, with the saved
+  checkpoint left out of the task's history); a panic in a queued message's drop reached the
+  caller with the row removed and the task's checkpoints left in the store; a panic in the drop
+  of a message sent to a task that had ended reached the caller, and the round's other errors
+  and the rest of the round were lost;
+  a panic in the drop of a refused message reached the caller and left the task's row as
   `Resident::Empty` for good; and a panic in both `cleanup` and `Drop` aborted the process.
 - **`ProtocolTaskPtr::from_box` drops a task it refuses before it panics.** Given a vtable for
   another type, `from_box` now drops the task and then panics, as its docs already said; a panic
@@ -180,6 +185,9 @@ back. No public signature changed. New public items: the field
     function (calling one is `unsafe`); `type_name()`, which reads the type's name, has been
     public since 0.3.0. `ProtocolVTable::from_raw_parts::<T>(..)`, an `unsafe const fn`, builds a
     vtable from hand-written functions, recorded as running `T`; it can build a `static`.
+    `type_name()` reads the name at run time only, because `std::any::type_name` is not `const`
+    on stable: 0.2.0's `type_name` field could be read in a `static`, but a name needed in a
+    `static` now has to be written out by hand.
   - `ProtocolTaskPtr`'s pointer and vtable. In 0.2.0 its fields were public, so safe code could
     pair a task with another type's vtable, or a dangling pointer with any vtable, and the drop
     freed it. The fields stay private. `ProtocolTaskPtr::data(&self) -> *mut ()` reads the task
@@ -188,6 +196,13 @@ back. No public signature changed. New public items: the field
     `vtable(&self)` has read the vtable since 0.3.0. To own a task given as the two parts,
     `ProtocolTaskPtr::from_raw_parts(data, vtable)`, an `unsafe fn`; `into_raw_parts(self)`
     gives both back without freeing the task.
+  - The empty `ProtocolTaskPtr`. In 0.2.0 a `ProtocolTaskPtr` whose `data` was null owned
+    nothing and its drop skipped it, so code could leave one in a slot it moved a task out of
+    (`mem::replace`). 0.3.0 removed that with the public fields. `from_raw_parts` takes a null
+    `data` again, for a pointer that owns nothing: dropping it runs nothing, and
+    `footprint_estimate`, safe since 0.3.0, returns 0 for it. Such a pointer is never polled,
+    woken, checkpointed, restored into, or put in a task row: `poll`, `on_wake`, `checkpoint`
+    and `raw_data` require a non-null `data`.
 - **Debug output names the type by its full path.** `{:?}` of a `ProtocolVTable` shows
   `type_name` as `std::any::type_name` gives it (`my_crate::jobs::Job`), where 0.2.0 showed the
   type as written in `derive_protocol_task_vtable!` (`Job`). This changed in 0.3.0 and stays, so

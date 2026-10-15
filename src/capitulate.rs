@@ -65,9 +65,11 @@ pub struct ReclaimReport<H> {
 /// A task the plan checkpoints that had work waiting (a message, a wake other than `QoS` or
 /// `MemoryPressure`, or a `Yield` it has not been polled for, whatever wakes came after it; a
 /// `Yield` counts only with `eager_repoll_after_yield`) stays runnable while dormant: the next
-/// round restores and polls it, so the plan puts the poll off but never drops it. A task woken
-/// only by `QoS` or `MemoryPressure` is answered by the checkpoint and stays dormant until its
-/// next wake.
+/// round restores and polls it (with `auto_restore_on_wake` on; with it off, once it is set back
+/// to true), so the plan puts the poll off but never drops it. Work the task was handed keeps its
+/// poll even when the save of the plan's checkpoint fails or the strategy panics: a later plan
+/// that checkpoints the task keeps it runnable too. A task woken only by `QoS` or
+/// `MemoryPressure` is answered by the checkpoint and stays dormant until its next wake.
 ///
 /// It is not asked about a task restored from a checkpoint until that task has been polled once,
 /// so a plan that holds for the task's whole life (such as the default budget rule) still lets it

@@ -1,6 +1,9 @@
+use crate::unwind::drop_payload;
 use crate::{TaskPoll, WakeReason};
 use std::any::TypeId;
 use std::fmt;
+use std::mem::ManuallyDrop;
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 
 /// A task the scheduler drives through a [`ProtocolVTable`].
 ///
@@ -14,6 +17,13 @@ use std::fmt;
 /// If `poll`, `on_wake`, `checkpoint`, `restore` or `footprint_estimate` panics, the scheduler
 /// catches it and the task ends as [`TaskState::Failed`](crate::TaskState::Failed), with a
 /// message naming the panic. That holds for any panic payload, even one whose own drop panics.
+///
+/// If `cleanup` or the task's own `Drop` panics while `run_once` or `pump` frees the task (at its
+/// end, or once its checkpoint is saved), the scheduler catches that too: the task is freed anyway,
+/// its row is left as it would have been (removed, or dormant after a checkpoint), and the panic
+/// is returned as an error once the round is done. If both panic, the task is still freed and the
+/// error names the panic from `cleanup`. Dropping the scheduler itself drops its live tasks as any
+/// value is dropped: a panic there goes to the code that drops the scheduler.
 pub unsafe trait ProtocolTask: Send + Sync + 'static {
     /// Advance the task.
     ///
@@ -41,7 +51,8 @@ pub unsafe trait ProtocolTask: Send + Sync + 'static {
     where
         Self: Sized;
 
-    /// Runs just before the task is freed.
+    /// Runs just before the task is freed. If it panics, the task is still dropped and freed, and
+    /// the panic goes on after that.
     ///
     /// # Safety
     /// As `poll`.
@@ -55,9 +66,10 @@ pub unsafe trait ProtocolTask: Send + Sync + 'static {
 
 /// The functions that run one task type, plus the type they were built for.
 ///
-/// Build it with [`ProtocolVTable::of`] or [`derive_protocol_task_vtable!`](crate::derive_protocol_task_vtable).
-/// The fields are private, so a vtable cannot claim one type while holding another type's
-/// functions:
+/// Build it with [`ProtocolVTable::of`] or [`derive_protocol_task_vtable!`](crate::derive_protocol_task_vtable),
+/// or from hand-written functions with the `unsafe` [`ProtocolVTable::from_raw_parts`]. The fields
+/// are private, so safe code cannot build a vtable that claims one type while holding another
+/// type's functions:
 ///
 /// ```compile_fail,E0451
 /// # use waker_protocol::{ProtocolTask, ProtocolVTable, TaskPoll};
@@ -69,6 +81,20 @@ pub unsafe trait ProtocolTask: Send + Sync + 'static {
 /// # }
 /// fn other_type() -> std::any::TypeId { std::any::TypeId::of::<u8>() }
 /// static LIAR: ProtocolVTable = ProtocolVTable { type_id: other_type, ..ProtocolVTable::of::<B>() };
+/// ```
+///
+/// and building one from hand-written functions takes `unsafe`:
+///
+/// ```compile_fail,E0133
+/// # use waker_protocol::{ProtocolVTable, TaskPoll, WakeReason};
+/// unsafe fn poll(_: *mut ()) -> TaskPoll { TaskPoll::Ready }
+/// unsafe fn wake(_: *mut (), _: WakeReason) {}
+/// unsafe fn checkpoint(_: *mut ()) -> Vec<u8> { Vec::new() }
+/// unsafe fn restore(_: &[u8]) -> *mut () { std::ptr::null_mut() }
+/// unsafe fn destroy(_: *mut ()) {}
+/// unsafe fn footprint(_: *const ()) -> usize { 0 }
+/// static LIAR: ProtocolVTable =
+///     ProtocolVTable::from_raw_parts::<u8>(poll, wake, checkpoint, restore, destroy, footprint);
 /// ```
 pub struct ProtocolVTable {
     poll_fn: unsafe fn(*mut ()) -> TaskPoll,
@@ -82,7 +108,8 @@ pub struct ProtocolVTable {
 }
 
 // SAFETY (all six): `data` is a live, exclusively held `T` from `Box::<T>::into_raw`, reached
-// only through a ProtocolTaskPtr whose vtable is `ProtocolVTable::of::<T>()`.
+// only through a ProtocolTaskPtr whose vtable is `ProtocolVTable::of::<T>()` (built by `from_box`,
+// `restore_from_bytes`, or a caller of `ProtocolTaskPtr::from_raw_parts` who promised exactly that).
 unsafe fn task_poll<T: ProtocolTask>(data: *mut ()) -> TaskPoll {
     // SAFETY: see above; the call itself is ProtocolTask's contract.
     unsafe { (*(data as *mut T)).poll() }
@@ -104,11 +131,24 @@ unsafe fn task_restore<T: ProtocolTask>(bytes: &[u8]) -> *mut () {
     Box::into_raw(Box::new(restored)) as *mut ()
 }
 
+/// Run the task's `cleanup`, then drop and free it. A panic in `cleanup` is held until the task is
+/// dropped, so it never unwinds through the live task (whose own drop, panicking during that
+/// unwind, would abort the process). The first panic goes on; if the drop panics too, its payload
+/// is dropped.
 unsafe fn task_destroy<T: ProtocolTask>(data: *mut ()) {
     // SAFETY: see above; this is the one place the box is freed.
     let mut boxed = unsafe { Box::from_raw(data as *mut T) };
     // SAFETY: the task is live and exclusively held.
-    unsafe { boxed.cleanup() };
+    let cleaned = catch_unwind(AssertUnwindSafe(|| unsafe { boxed.cleanup() }));
+    let dropped = catch_unwind(AssertUnwindSafe(move || drop(boxed)));
+    match (cleaned, dropped) {
+        (Ok(()), Ok(())) => {}
+        (Err(payload), Ok(())) | (Ok(()), Err(payload)) => resume_unwind(payload),
+        (Err(payload), Err(second)) => {
+            drop_payload(second);
+            resume_unwind(payload)
+        }
+    }
 }
 
 unsafe fn task_footprint<T: ProtocolTask>(data: *const ()) -> usize {
@@ -119,16 +159,124 @@ unsafe fn task_footprint<T: ProtocolTask>(data: *const ()) -> usize {
 impl ProtocolVTable {
     /// The vtable of `T`.
     pub const fn of<T: ProtocolTask>() -> Self {
+        // SAFETY: these are `T`'s own functions, each sound for a `T` from `Box::<T>::into_raw`
+        // under ProtocolTask's contract (see the comment above `task_poll`).
+        unsafe {
+            Self::from_raw_parts::<T>(
+                task_poll::<T>,
+                task_wake::<T>,
+                task_checkpoint::<T>,
+                task_restore::<T>,
+                task_destroy::<T>,
+                task_footprint::<T>,
+            )
+        }
+    }
+
+    /// A vtable from hand-written functions, recorded as running `T`. It is `const`, so it can
+    /// build a `static`:
+    ///
+    /// ```
+    /// # use waker_protocol::{ProtocolTask, ProtocolTaskPtr, ProtocolVTable, TaskPoll, WakeReason};
+    /// struct Job(u32);
+    /// # unsafe impl ProtocolTask for Job {
+    /// #     unsafe fn poll(&mut self) -> TaskPoll { TaskPoll::Ready }
+    /// #     unsafe fn checkpoint(&mut self) -> Vec<u8> { Vec::new() }
+    /// #     unsafe fn restore(_: &[u8]) -> Self { Job(0) }
+    /// # }
+    /// unsafe fn poll(data: *mut ()) -> TaskPoll {
+    ///     // SAFETY: `data` is a live, exclusively held `Job` (from_raw_parts' contract).
+    ///     let job = unsafe { &mut *(data as *mut Job) };
+    ///     job.0 += 1;
+    ///     TaskPoll::Ready
+    /// }
+    /// unsafe fn wake(_: *mut (), _: WakeReason) {}
+    /// unsafe fn checkpoint(_: *mut ()) -> Vec<u8> { Vec::new() }
+    /// unsafe fn restore(_: &[u8]) -> *mut () { Box::into_raw(Box::new(Job(0))) as *mut () }
+    /// // SAFETY: `data` is from `Box::<Job>::into_raw` and this is its last call (the contract).
+    /// unsafe fn destroy(data: *mut ()) { drop(unsafe { Box::from_raw(data as *mut Job) }) }
+    /// unsafe fn footprint(_: *const ()) -> usize { std::mem::size_of::<Job>() }
+    ///
+    /// // SAFETY: each function treats `data` as a `Box<Job>` pointer, as the contract asks.
+    /// static JOB: ProtocolVTable =
+    ///     unsafe { ProtocolVTable::from_raw_parts::<Job>(poll, wake, checkpoint, restore, destroy, footprint) };
+    ///
+    /// assert!(JOB.is_for::<Job>());
+    /// let mut task = ProtocolTaskPtr::from_box(Box::new(Job(0)), &JOB);
+    /// // SAFETY: `task` owns a live `Job` and `&mut` gives exclusive access.
+    /// assert_eq!(unsafe { task.poll() }, TaskPoll::Ready);
+    /// ```
+    ///
+    /// # Safety
+    /// The vtable records `T` as its task type, and the crate trusts that:
+    /// [`WakerProtocol::spawn_box`](crate::WakerProtocol::spawn_box) and
+    /// [`ProtocolTaskPtr::from_box`] accept it for a `Box<T>`, and the scheduler delivers a message
+    /// written for `T` by reading the task pointer as `*mut T`. Every task pointer `data` these
+    /// functions are given is a pointer from `Box::<T>::into_raw`, as `from_box` makes it, and is
+    /// live until `destroy_fn` frees it. So:
+    ///
+    /// - `restore_fn` is sound to call with any bytes (panicking is fine), and returns a new `data`
+    ///   from `Box::<T>::into_raw`, owned by its caller;
+    /// - `poll_fn`, `wake_fn` and `checkpoint_fn` are sound to call with a live `data` while the
+    ///   caller has exclusive access to the task, and leave it live;
+    /// - `footprint_fn` is sound to call with a live `data` while the caller has shared access to
+    ///   the task, and only reads;
+    /// - `destroy_fn` is sound to call once with a live `data`, as the last call, and frees it as
+    ///   the `Box<T>` it is.
+    pub const unsafe fn from_raw_parts<T: 'static>(
+        poll_fn: unsafe fn(*mut ()) -> TaskPoll,
+        wake_fn: unsafe fn(*mut (), WakeReason),
+        checkpoint_fn: unsafe fn(*mut ()) -> Vec<u8>,
+        restore_fn: unsafe fn(&[u8]) -> *mut (),
+        destroy_fn: unsafe fn(*mut ()),
+        footprint_fn: unsafe fn(*const ()) -> usize,
+    ) -> Self {
         Self {
-            poll_fn: task_poll::<T>,
-            wake_fn: task_wake::<T>,
-            checkpoint_fn: task_checkpoint::<T>,
-            restore_fn: task_restore::<T>,
-            destroy_fn: task_destroy::<T>,
-            footprint_fn: task_footprint::<T>,
+            poll_fn,
+            wake_fn,
+            checkpoint_fn,
+            restore_fn,
+            destroy_fn,
+            footprint_fn,
             type_id: TypeId::of::<T>,
             type_name: std::any::type_name::<T>,
         }
+    }
+
+    /// The function that polls a task. Calling it is `unsafe`; see
+    /// [`from_raw_parts`](Self::from_raw_parts) for what it expects.
+    pub const fn poll_fn(&self) -> unsafe fn(*mut ()) -> TaskPoll {
+        self.poll_fn
+    }
+
+    /// The function that tells a task why it woke. Calling it is `unsafe`; see
+    /// [`from_raw_parts`](Self::from_raw_parts).
+    pub const fn wake_fn(&self) -> unsafe fn(*mut (), WakeReason) {
+        self.wake_fn
+    }
+
+    /// The function that turns a task into checkpoint bytes. Calling it is `unsafe`; see
+    /// [`from_raw_parts`](Self::from_raw_parts).
+    pub const fn checkpoint_fn(&self) -> unsafe fn(*mut ()) -> Vec<u8> {
+        self.checkpoint_fn
+    }
+
+    /// The function that builds a task from checkpoint bytes and returns its new, owned pointer.
+    /// Calling it is `unsafe`; see [`from_raw_parts`](Self::from_raw_parts).
+    pub const fn restore_fn(&self) -> unsafe fn(&[u8]) -> *mut () {
+        self.restore_fn
+    }
+
+    /// The function that runs a task's `cleanup` and frees it. Calling it is `unsafe`; see
+    /// [`from_raw_parts`](Self::from_raw_parts).
+    pub const fn destroy_fn(&self) -> unsafe fn(*mut ()) {
+        self.destroy_fn
+    }
+
+    /// The function that reads a task's size estimate. Calling it is `unsafe`; see
+    /// [`from_raw_parts`](Self::from_raw_parts).
+    pub const fn footprint_fn(&self) -> unsafe fn(*const ()) -> usize {
+        self.footprint_fn
     }
 
     /// Whether this vtable runs `T`.
@@ -136,7 +284,8 @@ impl ProtocolVTable {
         (self.type_id)() == TypeId::of::<T>()
     }
 
-    /// The name of the task type this vtable runs.
+    /// The name of the task type this vtable runs: its full path, from
+    /// [`std::any::type_name`], the type the vtable records.
     pub fn type_name(&self) -> &'static str {
         (self.type_name)()
     }
@@ -154,9 +303,34 @@ impl fmt::Debug for ProtocolVTable {
     }
 }
 
-/// An owned task behind its vtable; freed (after `cleanup`) when dropped.
+/// An owned task behind its vtable; freed (after `cleanup`) when dropped. With a vtable from
+/// [`ProtocolVTable::of`] or [`derive_protocol_task_vtable!`](crate::derive_protocol_task_vtable),
+/// if `cleanup` panics, the task is still dropped and freed before the panic goes on.
 ///
-/// The fields are private, so the pointer and the vtable always belong to the same type.
+/// The fields are private, so the pointer and the vtable always belong to the same type; the one
+/// way to pair them by hand is the `unsafe` [`from_raw_parts`](Self::from_raw_parts). Safe code
+/// can neither pair them nor reach the pointer:
+///
+/// ```compile_fail,E0451
+/// # use waker_protocol::{ProtocolTaskPtr, ProtocolVTable};
+/// fn forge(data: *mut (), vtable: &'static ProtocolVTable) -> ProtocolTaskPtr {
+///     ProtocolTaskPtr { data, vtable }
+/// }
+/// ```
+///
+/// ```compile_fail,E0133
+/// # use waker_protocol::{ProtocolTaskPtr, ProtocolVTable};
+/// fn forge(data: *mut (), vtable: &'static ProtocolVTable) -> ProtocolTaskPtr {
+///     ProtocolTaskPtr::from_raw_parts(data, vtable)
+/// }
+/// ```
+///
+/// ```compile_fail,E0133
+/// # use waker_protocol::ProtocolTaskPtr;
+/// fn peek(task: &mut ProtocolTaskPtr) -> *mut () {
+///     task.raw_data()
+/// }
+/// ```
 pub struct ProtocolTaskPtr {
     data: *mut (),
     vtable: &'static ProtocolVTable,
@@ -183,7 +357,8 @@ impl ProtocolTaskPtr {
     /// Rebuild a task of `vtable`'s type from checkpoint bytes.
     pub fn restore_from_bytes(vtable: &'static ProtocolVTable, bytes: &[u8]) -> Self {
         Self {
-            // SAFETY: the vtable's restore builds its own type; ProtocolTask's contract accepts any bytes.
+            // SAFETY: the vtable's restore builds its own type and accepts any bytes (ProtocolTask's
+            // contract, or `ProtocolVTable::from_raw_parts`').
             data: unsafe { (vtable.restore_fn)(bytes) },
             vtable,
         }
@@ -202,8 +377,8 @@ impl ProtocolTaskPtr {
     /// # Safety
     /// ProtocolTask's contract for `poll`.
     pub unsafe fn poll(&mut self) -> TaskPoll {
-        // SAFETY: the pointer and vtable belong together (private fields), the task is live
-        // until Drop, and `&mut self` is exclusive.
+        // SAFETY: the pointer and vtable belong together (private fields; a caller of
+        // `from_raw_parts` promised it), the task is live until Drop, and `&mut self` is exclusive.
         unsafe { (self.vtable.poll_fn)(self.data) }
     }
 
@@ -227,16 +402,45 @@ impl ProtocolTaskPtr {
         unsafe { (self.vtable.footprint_fn)(self.data as *const ()) }
     }
 
-    /// The raw task pointer, for an [`Envelope`](crate::Envelope) whose target type matches.
-    pub(crate) fn raw_data(&mut self) -> *mut () {
+    /// The raw task pointer, as [`Envelope::dispatch`](crate::Envelope::dispatch) takes it. The
+    /// task stays owned by this `ProtocolTaskPtr`.
+    ///
+    /// # Safety
+    /// The call itself has no requirement. Using the pointer does: it points to the live task, a
+    /// value of the type `self.vtable()` records ([`ProtocolVTable::type_name`]), until the task is
+    /// freed (when `self` is dropped). Reads and writes through it must be as that type and must
+    /// not overlap any other use of the task, such as a call through `self`; and the task must not
+    /// be freed through it, since `self` owns it.
+    pub unsafe fn raw_data(&mut self) -> *mut () {
         self.data
+    }
+
+    /// Own the task `data` behind `vtable`, as [`into_raw_parts`](Self::into_raw_parts) gave
+    /// them out. Dropping the result runs `vtable`'s destroy function on `data`.
+    ///
+    /// # Safety
+    /// `data` is a pointer from `Box::<T>::into_raw`, where `T` is the type `vtable` records (see
+    /// [`ProtocolVTable::from_raw_parts`]), and the task behind it is live. The result owns it:
+    /// nothing else uses or frees `data` while the result lives. A pair from `into_raw_parts`
+    /// meets this, once.
+    pub unsafe fn from_raw_parts(data: *mut (), vtable: &'static ProtocolVTable) -> Self {
+        Self { data, vtable }
+    }
+
+    /// The task pointer and its vtable, without freeing the task: the caller owns it now. Give
+    /// both back to [`from_raw_parts`](Self::from_raw_parts) to own it again; a task never given
+    /// back is leaked.
+    pub fn into_raw_parts(self) -> (*mut (), &'static ProtocolVTable) {
+        let this = ManuallyDrop::new(self);
+        (this.data, this.vtable)
     }
 }
 
 impl Drop for ProtocolTaskPtr {
     fn drop(&mut self) {
-        // SAFETY: `data` came from Box::into_raw (from_box) or the vtable's restore, of the
-        // vtable's own type, and is freed only here.
+        // SAFETY: `data` came from Box::into_raw (from_box), the vtable's restore, or a caller of
+        // `from_raw_parts` who promised the same: a live task of the vtable's own type, owned by
+        // `self`, freed only here (`into_raw_parts` gives it up without dropping `self`).
         unsafe { (self.vtable.destroy_fn)(self.data) };
     }
 }

@@ -84,9 +84,12 @@ pub struct TaskPolicy {
     /// Checkpoint retention.
     pub retention: RetentionPolicy,
     /// Memory budget the default strategy enforces at Batch or lower: a task over it is
-    /// checkpointed in place of a poll, and the next round restores and polls it; the rule is not
-    /// applied to that first poll after a restore. So the task gets one poll for every wake,
-    /// message or `Yield`, one round later than a task within its budget.
+    /// checkpointed in place of a poll, and, if it had work waiting, the next round restores and
+    /// polls it; the rule is not applied to that first poll after a restore. So the task gets one
+    /// poll for every message, every wake other than `QoS` or `MemoryPressure`, and every `Yield`,
+    /// one round later than a task within its budget. A `QoS` or `MemoryPressure` wake reaches its
+    /// `on_wake` and is answered by the checkpoint, with no poll: the task stays dormant until
+    /// another wake or message.
     pub memory_budget_hint: Option<usize>,
     /// Reserved: the scheduler does not read it yet.
     pub dormancy_ttl: Option<Duration>,

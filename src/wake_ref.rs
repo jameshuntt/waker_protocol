@@ -28,6 +28,21 @@ impl TaskWakeSignal {
 
 derive_arc_unsafe_wakeable!(TaskWakeSignal, emit);
 
+/// The raw waker vtable of [`TaskWakeSignal`], declared as in 0.2.0 with
+/// `declare_raw_waker_vtable!(TaskWakeSignal, TASK_WAKE_SIGNAL_RAW_VTABLE)`. Its functions read a
+/// `RawWaker`'s data as the pointer `Arc::<TaskWakeSignal>::into_raw` returns, and the waker owns
+/// that strong ref. [`scheduler_waker`] builds its waker from the same four functions.
+pub use raw_vtable::TASK_WAKE_SIGNAL_RAW_VTABLE;
+
+mod raw_vtable {
+    // A macro invocation cannot carry a doc comment; the `pub use` above documents the static.
+    #![allow(missing_docs)]
+    use super::TaskWakeSignal;
+    use waker_tables::declare_raw_waker_vtable;
+
+    declare_raw_waker_vtable!(TaskWakeSignal, TASK_WAKE_SIGNAL_RAW_VTABLE);
+}
+
 /// A `std::task::Waker` that wakes task `id` with `reason`.
 pub fn scheduler_waker(
     id: TaskId,

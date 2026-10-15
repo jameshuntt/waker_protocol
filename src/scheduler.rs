@@ -6,11 +6,10 @@ use crate::slab::TaskSlab;
 use crate::task::{ProtocolTask, ProtocolTaskPtr, ProtocolVTable};
 use crate::types::{CheckpointReason, SchedulerMsg, TaskId, TaskPoll, TaskState, TaskStats, WakeReason};
 use crate::{CapitulatePlan, TaskPolicy};
+use crate::unwind::catch;
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use std::any::Any;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::marker::PhantomData;
-use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 use waker_tables::VTableKey;
@@ -50,10 +49,10 @@ pub enum Resident {
     Dormant,
     /// Out of its row while the scheduler works on it. No row is left this way when `run_once` or
     /// `pump` returns. A panic in the task's own `poll`, `on_wake`, `checkpoint`, `restore` or
-    /// `footprint_estimate` ends the task as Failed; a panic from the store's `save` or from the
-    /// capitulation strategy reaches the caller with the task put back in its row, live. The
-    /// store's `load` and `remove` are never called while the task is out of its row (see
-    /// [`run_once`](WakerProtocol::run_once)).
+    /// `footprint_estimate` ends the task as Failed; a panic in a message's `deliver` loses only
+    /// that message; a panic from the store's `save` or from the capitulation strategy reaches the
+    /// caller with the task put back in its row, live. The store's `load` and `remove` are never
+    /// called while the task is out of its row (see [`run_once`](WakerProtocol::run_once)).
     Empty,
 }
 
@@ -195,29 +194,22 @@ impl Drop for OutOfRow<'_> {
 /// Run `call`, the task's own function `name`. A panic in it is caught and becomes the message
 /// the task fails with. No panic leaves this function, not even one from dropping the payload.
 fn caught<R>(name: &str, call: impl FnOnce() -> R) -> Result<R, String> {
-    catch_unwind(AssertUnwindSafe(call)).map_err(|payload| {
-        let text = payload
-            .downcast_ref::<&str>()
-            .copied()
-            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-            .unwrap_or("a panic payload that is not text");
-        let message = format!("task panicked in {name}: {text}");
-        drop_payload(payload);
-        message
-    })
+    catch(call).map_err(|text| format!("task panicked in {name}: {text}"))
 }
 
-/// Drop a caught panic's payload without letting a panic out. If the payload's own drop panics,
-/// that panic is caught too and its payload dropped the same way; after three such panics in a
-/// row the last payload is leaked instead, so a payload that always panics cannot loop forever.
-fn drop_payload(mut payload: Box<dyn Any + Send>) {
-    for _ in 0..3 {
-        match catch_unwind(AssertUnwindSafe(move || drop(payload))) {
-            Ok(()) => return,
-            Err(again) => payload = again,
-        }
-    }
-    std::mem::forget(payload);
+/// Free `live`, task `id`'s live copy: its `cleanup`, then its drop. A panic in either is caught
+/// and returned as the error; the copy is freed either way. Every live copy `run_once` and `pump`
+/// free goes through here, once its row is settled and before the store is asked to remove
+/// anything.
+fn free(id: TaskId, live: ProtocolTaskPtr) -> Result<(), String> {
+    catch(move || drop(live)).map_err(|text| format!("task {id:?} panicked in cleanup or drop: {text}"))
+}
+
+/// Drop `envelope`, a message queued for task `id`, which is ending. A panic in the message's
+/// drop is caught and returned as the error.
+fn drop_message(id: TaskId, envelope: EnvelopePacket) -> Result<(), String> {
+    let kind = envelope.kind();
+    catch(move || drop(envelope)).map_err(|text| format!("message {kind:?} for task {id:?} panicked as it was dropped: {text}"))
 }
 
 /// Every error met while a round runs. A round never stops at an error: it finishes, then
@@ -416,8 +408,9 @@ impl<T: ProtocolTask> TaskHandle<T> {
     }
 
     /// Send the task a message; `deliver` runs with the task before its next poll, after the
-    /// messages sent before it. If `deliver` returns `Err`, only this message is lost: the task
-    /// goes on, and `run_once` or `pump` returns the error once its round is done.
+    /// messages sent before it. If `deliver` returns `Err` or panics, only this message is lost:
+    /// the task goes on, and `run_once` or `pump` returns the error (for a panic, one naming the
+    /// message, the task and the panic) once its round is done.
     pub fn send<M: Send + 'static>(
         &self,
         kind: &'static str,
@@ -492,7 +485,7 @@ impl<S: CheckpointStore> WakerProtocol<S> {
     /// The scheduler's own channel, for [`scheduler_waker`](crate::scheduler_waker) or a hand-built
     /// [`SchedulerMsg`]. A message for a task of another type is refused when its turn comes: only
     /// that message is dropped, the task goes on, and `run_once` or `pump` returns the error once
-    /// its round is done.
+    /// its round is done. A message whose `dispatch` panics is dropped the same way.
     pub fn sender(&self) -> Sender<SchedulerMsg> {
         self.tx.clone()
     }
@@ -559,13 +552,21 @@ impl<S: CheckpointStore> WakerProtocol<S> {
     /// A panic in a task's own `poll`, `on_wake`, `checkpoint`, `restore` or `footprint_estimate`
     /// is caught: the task ends as `TaskState::Failed`, with a message naming the panic, and is
     /// removed like any failed task (see [`finished`](Self::finished)); the round goes on. A panic
-    /// from the store's `save` or from the capitulation strategy reaches the caller, with the task
-    /// put back in its row, live.
+    /// in a message's `deliver` is caught and treated as a `deliver` that returned `Err`: only that
+    /// message is lost, the task stays live and is polled, and the error is returned after the
+    /// round. A panic in a task's `cleanup` or `Drop`, or in the drop of a message queued for a
+    /// task that is ending, is caught as the task is freed: the task is freed anyway, its row is
+    /// left removed (the task's end) or dormant (a checkpoint), the error is returned after the
+    /// round, and the round goes on.
     ///
-    /// A panic from the store's `load` also reaches the caller, and the task stays dormant. A
-    /// panic from its `remove` reaches the caller after the task is already dormant (a checkpoint)
-    /// or already removed and freed (the task's end); the checkpoints it had not yet removed stay
-    /// in the store, and in a dormant task's history, where a later prune tries them again.
+    /// A panic from the store's `save` or from the capitulation strategy reaches the caller, with
+    /// the task put back in its row, live.
+    ///
+    /// A panic from the store's `load` also reaches the caller, and the task stays dormant. The
+    /// store's `remove` is called only once the task is dormant (a checkpoint) or removed and
+    /// freed, its queued messages dropped (the task's end), so a panic from it reaches the caller
+    /// after all of that; the checkpoints it had not yet removed stay in the store, and in a
+    /// dormant task's history, where a later prune tries them again.
     ///
     /// After a Shutdown message has been handled this does nothing: later messages stay in the
     /// channel, and no task is restored or polled.
@@ -745,16 +746,15 @@ impl<S: CheckpointStore> WakerProtocol<S> {
             Ok(restored) => restored,
             // These bytes will never restore: the task ends as Failed, and retain_on_failure
             // decides whether they stay in the store.
-            Err(panic) => return self.finish(id, TaskState::Failed(panic)),
+            Err(panic) => return self.finish(id, TaskState::Failed(panic), None),
         };
 
-        if let Some(entry) = self.tasks.get_mut(id) {
-            entry.resident = Resident::Live(restored);
-            entry.state = TaskState::Runnable;
-            entry.stats.restore_count += 1;
-            entry.pending_wakes.push_back(WakeReason::Resume);
-            self.restored.insert(id);
-        }
+        let Some(entry) = self.tasks.get_mut(id) else { return free(id, restored) };
+        entry.resident = Resident::Live(restored);
+        entry.state = TaskState::Runnable;
+        entry.stats.restore_count += 1;
+        entry.pending_wakes.push_back(WakeReason::Resume);
+        self.restored.insert(id);
 
         Ok(())
     }
@@ -780,8 +780,9 @@ impl<S: CheckpointStore> WakerProtocol<S> {
 
     /// Deliver task `id`'s messages and wakes, ask the strategy, then poll it. Every error is
     /// noted in `errors`, and the task always ends settled: live, dormant or removed. A panic in
-    /// the task's `footprint_estimate`, `on_wake` or `poll` ends it as Failed; a panic from the
-    /// strategy reaches the caller with the task back in its row, live.
+    /// the task's `footprint_estimate`, `on_wake` or `poll` ends it as Failed; a panic in a
+    /// message's `deliver` loses only that message; a panic from the strategy reaches the caller
+    /// with the task back in its row, live.
     fn poll_one(&mut self, id: TaskId, errors: &mut Errors) {
         // A task restored for this round is polled before the strategy is asked about it again.
         let restored = self.restored.contains(&id);
@@ -828,19 +829,26 @@ impl<S: CheckpointStore> WakerProtocol<S> {
     }
 
     /// Hand `envelope` to `live`, task `id`, or refuse it if it was written for another task
-    /// type. Either way the envelope is used up; the task is untouched by a refusal.
+    /// type. Either way the envelope is used up; the task is untouched by a refusal. A panic in
+    /// the message's `deliver` (or in its drop, once refused) is caught and returned as the
+    /// error, as an `Err` from `deliver` is: only this message is lost, and the task goes on.
     fn deliver(id: TaskId, live: &mut ProtocolTaskPtr, envelope: EnvelopePacket) -> Result<(), String> {
-        if envelope.target_type() != live.task_type_id() {
-            return Err(format!(
-                "envelope {:?} for task {:?} targets another task type than {}",
-                envelope.kind(),
-                id,
-                live.vtable().type_name()
-            ));
-        }
-        // SAFETY: the envelope targets exactly the type `live` holds (checked above), and `live`
-        // is out of its row, so this access is exclusive.
-        unsafe { envelope.dispatch(live.raw_data()) }
+        let kind = envelope.kind();
+        catch(move || {
+            if envelope.target_type() != live.task_type_id() {
+                return Err(format!(
+                    "envelope {:?} for task {:?} targets another task type than {}",
+                    kind,
+                    id,
+                    live.vtable().type_name()
+                ));
+            }
+            // SAFETY: the envelope targets exactly the type `live` holds (checked above), and
+            // `live` is out of its row, so this access is exclusive; `raw_data` itself has no
+            // requirement beyond that use.
+            unsafe { envelope.dispatch(live.raw_data()) }
+        })
+        .unwrap_or_else(|text| Err(format!("message {kind:?} for task {id:?} panicked: {text}")))
     }
 
     /// Carry out `settle` on task `id` from outside a poll: a message, or Shutdown.
@@ -855,44 +863,44 @@ impl<S: CheckpointStore> WakerProtocol<S> {
         let Some(live) = live else {
             // Dormant: its checkpoint is already in the store, so only Finish changes anything.
             return match settle {
-                Settle::Finish(state) => self.finish(id, state),
+                Settle::Finish(state) => self.finish(id, state, None),
                 Settle::Wait | Settle::RunAgain | Settle::Checkpoint(_) | Settle::CheckpointAndRunAgain(_) => Ok(()),
             };
         };
 
         match settle {
-            Settle::Wait => self.put_back(id, live, TaskState::Waiting),
+            Settle::Wait => self.put_back(id, live, TaskState::Waiting, None),
             Settle::RunAgain => {
                 let seq = self.bump_seq();
-                self.put_back(id, live, TaskState::Runnable);
-                if let Some(entry) = self.tasks.get_mut(id) {
-                    entry.runnable_seq = seq;
-                }
+                self.put_back(id, live, TaskState::Runnable, Some(seq))
             }
-            Settle::Checkpoint(reason) => return self.checkpoint_live(id, live, reason, false),
-            Settle::CheckpointAndRunAgain(reason) => return self.checkpoint_live(id, live, reason, true),
-            Settle::Finish(state) => {
-                let finished = self.finish(id, state);
-                drop(live); // runs the task's cleanup and frees it, once its row is gone
-                return finished;
-            }
+            Settle::Checkpoint(reason) => self.checkpoint_live(id, live, reason, false),
+            Settle::CheckpointAndRunAgain(reason) => self.checkpoint_live(id, live, reason, true),
+            Settle::Finish(state) => self.finish(id, state, Some(live)),
         }
-        Ok(())
     }
 
-    fn put_back(&mut self, id: TaskId, live: ProtocolTaskPtr, state: TaskState) {
-        if let Some(entry) = self.tasks.get_mut(id) {
-            entry.resident = Resident::Live(live);
-            entry.state = state;
+    /// Put `live` back in task `id`'s row as `state`; with `seq`, it waits to run behind the tasks
+    /// already waiting. With no row left to put it in, it is freed.
+    fn put_back(&mut self, id: TaskId, live: ProtocolTaskPtr, state: TaskState, seq: Option<u64>) -> Result<(), String> {
+        let Some(entry) = self.tasks.get_mut(id) else { return free(id, live) };
+        entry.resident = Resident::Live(live);
+        entry.state = state;
+        if let Some(seq) = seq {
+            entry.runnable_seq = seq;
         }
+        Ok(())
     }
 
     /// Checkpoint `live`, task `id`, and leave the task dormant; with `run_again` its state stays
     /// `Runnable`, so the next round restores and polls it. The task is freed only once its bytes
     /// are saved: if the save fails, or panics, it goes back into its row, live and as it was, and
     /// the error (or the panic) goes to the caller. If the task's own `footprint_estimate` or
-    /// `checkpoint` panics, the task ends as Failed. A panic from the store's `remove`, while older
-    /// checkpoints are pruned, comes once the task is dormant.
+    /// `checkpoint` panics, the task ends as Failed. Once saved, the row is made dormant, then the
+    /// live copy is freed (a panic in its `cleanup` or drop is returned as an error; the task stays
+    /// dormant), and only then are older checkpoints pruned: a panic from the store's `remove`
+    /// comes once the task is dormant and its live copy freed, and leaves the checkpoints not yet
+    /// removed in its history.
     fn checkpoint_live(
         &mut self,
         id: TaskId,
@@ -916,11 +924,13 @@ impl<S: CheckpointStore> WakerProtocol<S> {
                 return self.settle(id, Some(live), Settle::Finish(TaskState::Failed(panic)));
             }
         };
-        // If the save fails, `out` puts the task back in its row as it returns the error.
+        // If the save fails, `out` puts the task back in its row as it returns the error; so it
+        // does if the store's code panics in `save` or in cloning the handle.
         let handle = self.store.save(id, payload)?;
+        let logged = handle.clone();
         let live = out.release();
 
-        entry.checkpoint_history.push_back(handle.clone());
+        entry.checkpoint_history.push_back(handle);
         entry.stats.checkpoint_count += 1;
         entry.resident = Resident::Dormant;
         match run_again {
@@ -930,6 +940,8 @@ impl<S: CheckpointStore> WakerProtocol<S> {
             }
             None => entry.state = TaskState::Dormant,
         }
+        let mut errors = Errors::default();
+        errors.note(free(id, live));
 
         let after_bytes = std::mem::size_of::<TaskId>();
         self.reclaim_log.push(ReclaimReport {
@@ -938,23 +950,31 @@ impl<S: CheckpointStore> WakerProtocol<S> {
             before_bytes,
             after_bytes,
             reclaimed_bytes: before_bytes.saturating_sub(after_bytes),
-            handle: Some(handle),
+            handle: Some(logged),
         });
         // A dormant task keeps at least the checkpoint it will be restored from.
         let keep = entry.policy.retention.keep_latest.max(1);
-        let pruned = Self::prune(&self.store, &mut entry.checkpoint_history, keep);
-        drop(live); // runs the task's cleanup and frees it, once its row is settled
-        pruned
+        errors.note(Self::prune(&self.store, &mut entry.checkpoint_history, keep));
+        errors.finish()
     }
 
     /// End task `id` as `state`, record it in `finished` and remove its row; the one way a task
-    /// leaves the scheduler. A live copy still in the row is freed with it. Its checkpoints go,
-    /// unless the retention policy keeps them for `state`; then the latest `keep_latest` stay in
-    /// the store.
-    fn finish(&mut self, id: TaskId, state: TaskState) -> Result<(), String> {
-        let Some(mut entry) = self.tasks.remove(id) else { return Ok(()) };
+    /// leaves the scheduler. `live` is its live copy when it was taken out of its row.
+    ///
+    /// The row is removed first. Then the task's live copy (`live`, or one still in the row) is
+    /// freed and its queued messages are dropped, each on its own, a panic in any of them returned
+    /// as an error. Only then are its checkpoints removed from the store, so a panic from the
+    /// store's `remove` never unwinds through the task or its messages. Its checkpoints go, unless
+    /// the retention policy keeps them for `state`; then the latest `keep_latest` stay in the store.
+    fn finish(&mut self, id: TaskId, state: TaskState, live: Option<ProtocolTaskPtr>) -> Result<(), String> {
+        let mut errors = Errors::default();
+        let Some(entry) = self.tasks.remove(id) else {
+            errors.note(live.map_or(Ok(()), |live| free(id, live)));
+            return errors.finish();
+        };
         self.restored.remove(&id);
-        let retention = &entry.policy.retention;
+        let TaskEntry { resident, mailbox, mut checkpoint_history, policy, .. } = entry;
+        let retention = &policy.retention;
         let retain = match &state {
             TaskState::Completed => retention.retain_on_completion,
             TaskState::Failed(_) => retention.retain_on_failure,
@@ -963,9 +983,19 @@ impl<S: CheckpointStore> WakerProtocol<S> {
         };
         let keep = if retain { retention.keep_latest } else { 0 };
         self.finished.push((id, state));
-        let pruned = Self::prune(&self.store, &mut entry.checkpoint_history, keep);
-        drop(entry);
-        pruned
+
+        let in_row = match resident {
+            Resident::Live(in_row) => Some(in_row),
+            Resident::Dormant | Resident::Empty => None,
+        };
+        for live in live.into_iter().chain(in_row) {
+            errors.note(free(id, live));
+        }
+        for envelope in mailbox {
+            errors.note(drop_message(id, envelope));
+        }
+        errors.note(Self::prune(&self.store, &mut checkpoint_history, keep));
+        errors.finish()
     }
 
     /// Remove all but the latest `keep` checkpoints of `history` from the store, oldest first. A

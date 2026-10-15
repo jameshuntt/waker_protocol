@@ -27,6 +27,8 @@ pub mod types;
 /// `std::task::Waker`s that wake a scheduler task.
 pub mod wake_ref;
 
+mod unwind;
+
 pub use capitulate::*;
 pub use checkpoint::*;
 pub use envelope::*;

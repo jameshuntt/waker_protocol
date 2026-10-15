@@ -1,6 +1,7 @@
-//! The docs say what the code does. Each test below checks a sentence a review of 0.3.0 or 0.3.1
-//! found false: the old wording is gone and the new wording is there. The test named in each
-//! comment, in tests/scheduler.rs or src/slab.rs, proves the new wording against the code.
+//! The docs say what the code does. Each test below checks a sentence a review of 0.3.0, 0.3.1 or
+//! the 0.3.2 draft found false, or a sentence 0.3.2 adds: the old wording, if any, is gone and the
+//! new wording is there. The test named in each comment, in tests/scheduler.rs, tests/from_0_2.rs
+//! or src/slab.rs, proves the new wording against the code.
 
 const SCHEDULER: &str = include_str!("../src/scheduler.rs");
 const POLICY: &str = include_str!("../src/policy.rs");
@@ -10,8 +11,15 @@ const CAPITULATE: &str = include_str!("../src/capitulate.rs");
 const TASK: &str = include_str!("../src/task.rs");
 const README: &str = include_str!("../readme.md");
 
+const DOC_CLAIMS: &str = include_str!("doc_claims.rs");
+
 fn says(doc: &str, old: &str, new: &str) {
     assert!(!doc.contains(old), "still says {old:?}");
+    assert!(doc.contains(new), "does not say {new:?}");
+}
+
+/// For a sentence that is new, with no old wording it replaces.
+fn tells(doc: &str, new: &str) {
     assert!(doc.contains(new), "does not say {new:?}");
 }
 
@@ -102,7 +110,7 @@ fn every_task_function_the_scheduler_catches_is_named() {
 fn only_a_panic_in_the_stores_save_is_said_to_put_the_task_back_live() {
     says(SCHEDULER, "a panic from the checkpoint store or the capitulation strategy", "from the store's `save` or from the capitulation strategy reaches the caller");
     says(SCHEDULER, "or the store panics, it goes back", "A panic from the store's `load` also reaches the caller, and the task stays dormant.");
-    says(SCHEDULER, "from the store or the strategy reaches the caller", "already removed and freed (the task's end)");
+    says(SCHEDULER, "from the store or the strategy reaches the caller", "freed, its queued messages dropped (the task's end)");
     says(README, "In 0.3.1 each of these panics freed the task", "or in the store's `save` freed the task");
     says(README, "A panic from the checkpoint store or the capitulation strategy still", "`load` also reaches the caller, and the task stays dormant.");
 }
@@ -114,4 +122,76 @@ fn strategy_docs_say_when_it_is_asked_and_that_a_plan_never_drops_a_poll() {
     says(CAPITULATE, "Decides, before each poll,", "Decides, before a poll, whether a task should capitulate (not before the first poll");
     says(CAPITULATE, "(a restore adds `Resume`)", "a just-restored task is not shown to the strategy");
     says(CAPITULATE, "and the task is\n/// not polled.", "so the plan puts the poll off but never drops it");
+}
+
+/// The header of this file named only the releases, but two of its tests check wording only the
+/// 0.3.2 draft had. The strings are split so the test does not find itself.
+#[test]
+fn this_files_header_names_the_draft_as_well() {
+    says(
+        DOC_CLAIMS,
+        concat!("a review of 0.3.0 ", "or 0.3.1 found false"),
+        concat!("a review of 0.3.0, 0.3.1 or\n//! the 0.3.2 draft ", "found false"),
+    );
+}
+
+/// Proved by `an_over_budget_task_gets_no_poll_for_a_qos_or_memory_pressure_wake_and_one_for_any_other`
+/// and `a_task_woken_only_by_qos_or_memory_pressure_stays_dormant_after_the_strategy_checkpoints_it`.
+#[test]
+fn the_budget_docs_say_a_qos_or_memory_pressure_wake_gets_no_poll() {
+    says(POLICY, "checkpointed in place of a poll, and the next round restores and polls it;", "if it had work waiting, the next round restores and");
+    says(POLICY, "one poll for every wake,", "poll for every message, every wake other than `QoS` or `MemoryPressure`, and every `Yield`,");
+    says(POLICY, "one poll for every wake,", "`on_wake` and is answered by the checkpoint, with no poll");
+    says(README, "wake, every message and every `Yield`", "message, every wake other than `QoS` or `MemoryPressure`, and every `Yield`, a round later");
+}
+
+/// Proved by `a_panic_in_a_messages_deliver_drops_only_that_message_and_the_round_goes_on` and
+/// `a_panic_in_cleanup_or_drop_is_an_error_for_the_round_and_the_round_goes_on`.
+#[test]
+fn the_docs_say_what_a_panic_in_deliver_cleanup_or_drop_does() {
+    let old_heading = "**A panic in the task's own code ends only that task.**";
+    says(README, old_heading, "**A panic in a message's `deliver` loses only that message.**");
+    says(README, old_heading, "**A panic in `cleanup` or in a task's `Drop` is an error, not a stop.**");
+    says(README, old_heading, "**A panic in `poll`, `on_wake`, `checkpoint`, `restore` or `footprint_estimate` ends only\n  that task.**");
+    says(SCHEDULER, "If `deliver` returns `Err`, only this message is lost", "If `deliver` returns `Err` or panics, only this message is lost");
+    tells(SCHEDULER, "is caught and treated as a `deliver` that returned `Err`");
+    tells(SCHEDULER, "A panic in a task's `cleanup` or `Drop`, or in the drop of a message queued for a");
+    says(TASK, "/// Runs just before the task is freed.\n", "Runs just before the task is freed. If it panics, the task is still dropped and freed");
+    tells(TASK, "If `cleanup` or the task's own `Drop` panics while `run_once` or `pump` frees the task");
+}
+
+/// Proved by `the_store_is_asked_to_remove_checkpoints_only_once_the_task_is_freed`,
+/// `a_panic_from_the_stores_remove_at_a_tasks_end_comes_after_the_task_and_its_messages_are_freed`
+/// and `a_panic_from_the_stores_remove_while_a_checkpoint_prunes_comes_after_the_live_copy_is_freed`.
+#[test]
+fn the_docs_say_the_store_removes_checkpoints_only_once_the_task_is_freed() {
+    says(
+        SCHEDULER,
+        "panic from its `remove` reaches the caller after the task is already dormant",
+        "store's `remove` is called only once the task is dormant (a checkpoint) or removed and",
+    );
+    says(README, "a panic from `load` or `remove` did then what", "A panic from `load` did then what it does now.");
+    says(README, "a panic from `load` or `remove` did then what", "handles not yet removed out of a dormant task's history");
+    says(
+        README,
+        "comes after the task is already dormant (a checkpoint) or already removed and freed (the task's",
+        "The store's `remove` is called only\n  once the task is dormant and its live copy freed (a checkpoint)",
+    );
+}
+
+/// Proved by every test in tests/from_0_2.rs; the Debug output by
+/// `debug_output_shows_the_full_type_path`.
+#[test]
+fn the_readme_lists_what_came_back_from_0_2_0_and_the_debug_output() {
+    tells(README, "**Put back from 0.2.0.** 0.3.0 removed these, and its notes did not say so.");
+    tells(README, "`TASK_WAKE_SIGNAL_RAW_VTABLE`, the raw waker vtable of `TaskWakeSignal`");
+    tells(README, "`ProtocolTaskPtr::raw_data(&mut self) -> *mut ()`, public again and `unsafe`, as in 0.2.0.");
+    tells(README, "`ProtocolVTable::from_raw_parts::<T>(..)`, an `unsafe const fn`");
+    tells(README, "`ProtocolTaskPtr::from_raw_parts(data, vtable)`, an\n    `unsafe fn`");
+    tells(README, "**Debug output names the type by its full path.**");
+    says(
+        README,
+        "No public signature changed; `WakerProtocol` has one new public\nfield, `finished`.",
+        "New public items: the field\n`WakerProtocol::finished`, and the 0.2.0 items listed under **Put back from 0.2.0**.",
+    );
 }

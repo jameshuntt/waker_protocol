@@ -111,6 +111,7 @@ fn scheduler_with<S: CheckpointStore>(store: S, strategy: Box<dyn CapitulateStra
     sched.register_vtable(OTHER, &OTHER_VTABLE);
     sched.register_vtable(SCRIPTED, &SCRIPTED_VTABLE);
     sched.register_vtable(PANICKY, &PANICKY_VTABLE);
+    sched.register_vtable(FRAGILE, &FRAGILE_VTABLE);
     sched
 }
 
@@ -586,6 +587,7 @@ impl CheckpointStore for FlakyStore {
     }
 
     fn remove(&self, handle: &CheckpointHandle) -> Result<(), String> {
+        ORDER.with(|o| o.borrow_mut().push("store.remove"));
         if self.panicking_remove.load(Ordering::SeqCst) {
             panic!("store bug in remove");
         }
@@ -1723,4 +1725,279 @@ fn the_strategy_is_never_shown_a_task_just_restored() {
     assert_eq!((entry.stats.restore_count, entry.stats.poll_count), (3, 7));
     let pending: Vec<_> = seen.lock().unwrap().iter().map(|s| s.pending_wakes).collect();
     assert_eq!(pending, [1, 1, 1, 1], "asked for 4 of the 7 polls, never with a restore's Resume counted");
+}
+
+// ---------------------------------------------------------------------------------------------
+// 0.3.2, third review: a panic in a message's `deliver`, or in a task's `cleanup` or `Drop`, is
+// caught and is an error for the round; the store's `remove` is called only once the task is freed.
+
+/// Where a [`Fragile`] task panics as it is freed: in `cleanup`, in its own drop, or both.
+const IN_CLEANUP: u8 = 1;
+const IN_DROP: u8 = 2;
+
+/// Gives the poll `poll` (a [`Scripted`] code: READY, PENDING or CHECKPOINT) every time, and
+/// panics as it is freed where `panic_in` says. Writes "cleanup" and "drop" to ORDER.
+struct Fragile {
+    poll: u8,
+    panic_in: u8,
+}
+
+impl Fragile {
+    fn boxed(poll: u8, panic_in: u8) -> Box<Self> {
+        Box::new(Self { poll, panic_in })
+    }
+}
+
+/// A message `deliver` that sets where a [`Fragile`] task panics as it is freed.
+fn arm(task: &mut Fragile, panic_in: u8) -> Result<(), String> {
+    task.panic_in = panic_in;
+    Ok(())
+}
+
+impl Drop for Fragile {
+    fn drop(&mut self) {
+        DROPS.with(|d| d.set(d.get() + 1));
+        ORDER.with(|o| o.borrow_mut().push("drop"));
+        if self.panic_in & IN_DROP != 0 {
+            panic!("boom in drop");
+        }
+    }
+}
+
+// SAFETY: the functions only touch `self`; `restore` panics on short bytes.
+unsafe impl ProtocolTask for Fragile {
+    unsafe fn poll(&mut self) -> TaskPoll {
+        match self.poll {
+            READY => TaskPoll::Ready,
+            CHECKPOINT => TaskPoll::Checkpoint(CheckpointReason::Manual),
+            _ => TaskPoll::Pending,
+        }
+    }
+
+    unsafe fn checkpoint(&mut self) -> Vec<u8> {
+        vec![self.poll, self.panic_in]
+    }
+
+    unsafe fn restore(bytes: &[u8]) -> Self {
+        Self { poll: bytes[0], panic_in: bytes[1] }
+    }
+
+    unsafe fn cleanup(&mut self) {
+        ORDER.with(|o| o.borrow_mut().push("cleanup"));
+        if self.panic_in & IN_CLEANUP != 0 {
+            panic!("boom in cleanup");
+        }
+    }
+}
+
+derive_protocol_task_vtable!(Fragile, FRAGILE_VTABLE);
+const FRAGILE: VTableKey = VTableKey { segment: "test", kind: "fragile", version: 1 };
+
+/// A message whose drop panics. Writes "message drop" to ORDER.
+struct Grenade;
+
+impl Drop for Grenade {
+    fn drop(&mut self) {
+        ORDER.with(|o| o.borrow_mut().push("message drop"));
+        panic!("boom in a message's drop");
+    }
+}
+
+#[test]
+fn a_panic_in_a_messages_deliver_drops_only_that_message_and_the_round_goes_on() {
+    let mut sched = scheduler();
+    let before = drops();
+    let h = sched.spawn_box(COUNTER, Counter::boxed("d", 100), TaskPolicy::default()).unwrap();
+    let background = TaskPolicy { qos: QoSClass::Background, ..TaskPolicy::default() };
+    let after = sched.spawn_box(COUNTER, Counter::boxed("after", 100), background).unwrap();
+    sched.run_once().unwrap();
+    clear_order();
+
+    // An error noted earlier in the round, which the panic must not lose.
+    let wrong = typed_envelope::<Other, u64>("wrong type", 1, |_, _| Ok(()));
+    sched.sender().send(SchedulerMsg::Deliver { id: h.id(), envelope: wrong }).unwrap();
+    h.send("first", "first", note).unwrap();
+    h.send("panics", "panics", |_, _| panic!("boom in deliver")).unwrap();
+    h.send("last", "last", note).unwrap();
+    after.wake(WakeReason::Manual).unwrap();
+    let round = catch_unwind(AssertUnwindSafe(|| sched.run_once()));
+
+    let Ok(Err(err)) = round else { panic!("the deliver's panic reached the caller, or nothing was returned") };
+    let errors: Vec<&str> = err.split("; ").collect();
+    assert_eq!(errors.len(), 2, "{err}");
+    assert!(errors[0].starts_with("envelope \"wrong type\""), "the earlier error is kept: {err}");
+    assert_eq!(errors[1], format!("message \"panics\" for task {:?} panicked: boom in deliver", h.id()));
+    assert_eq!(order(), ["first", "last", "d", "after"], "the other messages arrive, the task and the one after it are polled");
+    assert!(is_live(&sched, h.id()), "the task stays live in its row");
+    assert_eq!(drops() - before, 0, "nothing is freed");
+}
+
+#[test]
+fn a_panic_in_cleanup_or_drop_is_an_error_for_the_round_and_the_round_goes_on() {
+    for panic_in in [IN_CLEANUP, IN_DROP, IN_CLEANUP | IN_DROP] {
+        for poll in [READY, CHECKPOINT] {
+            let case = format!("panic_in {panic_in}, poll {poll}");
+            let mut sched = scheduler();
+            let before = drops();
+            let h = sched.spawn_box(FRAGILE, Fragile::boxed(poll, panic_in), TaskPolicy::default()).unwrap();
+            let background = TaskPolicy { qos: QoSClass::Background, ..TaskPolicy::default() };
+            let after = sched.spawn_box(COUNTER, Counter::boxed("after", 100), background).unwrap();
+            let round = catch_unwind(AssertUnwindSafe(|| sched.run_once()));
+
+            let text = if panic_in & IN_CLEANUP != 0 { "boom in cleanup" } else { "boom in drop" };
+            let expected = format!("task {:?} panicked in cleanup or drop: {text}", h.id());
+            assert!(matches!(&round, Ok(Err(err)) if *err == expected), "{case}: {round:?}");
+            assert_eq!(row(&sched, after.id()).stats.poll_count, 1, "{case}: the task after it is polled in that round");
+            assert_eq!(drops() - before, 1, "{case}: the task is freed once");
+            if poll == READY {
+                assert!(sched.tasks.get(h.id()).is_none(), "{case}: its row is removed");
+                assert_eq!(sched.finished, [(h.id(), TaskState::Completed)], "{case}: it ended as it said");
+            } else {
+                let entry = row(&sched, h.id());
+                assert!(matches!(entry.resident, Resident::Dormant), "{case}: it is dormant");
+                assert_eq!(entry.checkpoint_history.len(), 1, "{case}: with its checkpoint");
+            }
+        }
+    }
+}
+
+#[test]
+fn the_store_is_asked_to_remove_checkpoints_only_once_the_task_is_freed() {
+    // A task's end: the row goes, the task is freed, then its checkpoint is removed.
+    let mut sched = flaky();
+    let h = sched.spawn_box(FRAGILE, Fragile::boxed(PENDING, 0), TaskPolicy::default()).unwrap();
+    sched.run_once().unwrap();
+    h.checkpoint(CheckpointReason::Manual).unwrap();
+    sched.run_once().unwrap();
+    h.wake(WakeReason::Manual).unwrap();
+    sched.run_once().unwrap(); // restored and polled
+    clear_order();
+    h.cancel().unwrap();
+    sched.run_once().unwrap();
+    assert_eq!(order(), ["cleanup", "drop", "store.remove"], "the task's end");
+
+    // A checkpoint: the row goes dormant, the live copy is freed, then the older one is pruned.
+    let h = sched.spawn_box(FRAGILE, Fragile::boxed(CHECKPOINT, 0), TaskPolicy::default()).unwrap();
+    sched.run_once().unwrap(); // first checkpoint
+    h.wake(WakeReason::Manual).unwrap();
+    clear_order();
+    sched.run_once().unwrap(); // restored, polled, checkpointed again; the first is pruned
+    assert_eq!(order(), ["cleanup", "drop", "store.remove"], "a checkpoint");
+}
+
+#[test]
+fn a_panic_from_the_stores_remove_at_a_tasks_end_comes_after_the_task_and_its_messages_are_freed() {
+    for live in [true, false] {
+        let mut sched = flaky();
+        let before = drops();
+        let h = sched.spawn_box(FRAGILE, Fragile::boxed(PENDING, 0), TaskPolicy::default()).unwrap();
+        sched.run_once().unwrap();
+        h.checkpoint(CheckpointReason::Manual).unwrap();
+        sched.run_once().unwrap(); // dormant, one checkpoint
+        if live {
+            h.send("arm", IN_CLEANUP, arm).unwrap();
+            sched.run_once().unwrap(); // restored, armed and polled
+        }
+
+        // The task's cleanup panics (when live) and a queued message's drop panics; with a
+        // store whose `remove` fails, each is an error of the round.
+        sched.store.fail_remove(true);
+        h.send("grenade", Grenade, |_: &mut Fragile, _| Ok(())).unwrap();
+        h.cancel().unwrap();
+        clear_order();
+        let err = sched.run_once().unwrap_err();
+        let mut expected = Vec::new();
+        if live {
+            expected.push(format!("task {:?} panicked in cleanup or drop: boom in cleanup", h.id()));
+        }
+        expected.push(format!("message \"grenade\" for task {:?} panicked as it was dropped: boom in a message's drop", h.id()));
+        expected.push("remove failed".to_string());
+        assert_eq!(err, expected.join("; "), "live {live}");
+        assert_eq!(sched.finished, [(h.id(), TaskState::Cancelled)], "live {live}");
+        let freed: &[&str] = if live { &["cleanup", "drop", "message drop"] } else { &["message drop"] };
+        assert_eq!(order()[..freed.len()], *freed, "live {live}: freed before the store is asked");
+        assert_eq!(order().last(), Some(&"store.remove"), "live {live}");
+        assert_eq!(drops() - before, if live { 2 } else { 1 }, "live {live}: every copy freed once");
+    }
+
+    // The same with a store whose `remove` panics: its panic reaches the caller, after the frees,
+    // and the process does not abort.
+    for live in [true, false] {
+        let mut sched = flaky();
+        let before = drops();
+        let h = sched.spawn_box(FRAGILE, Fragile::boxed(PENDING, 0), TaskPolicy::default()).unwrap();
+        sched.run_once().unwrap();
+        h.checkpoint(CheckpointReason::Manual).unwrap();
+        sched.run_once().unwrap();
+        if live {
+            h.send("arm", IN_CLEANUP | IN_DROP, arm).unwrap();
+            sched.run_once().unwrap();
+        }
+
+        sched.store.panic_on_remove(true);
+        h.send("grenade", Grenade, |_: &mut Fragile, _| Ok(())).unwrap();
+        h.cancel().unwrap();
+        clear_order();
+        assert!(catch_unwind(AssertUnwindSafe(|| sched.run_once())).is_err(), "live {live}: remove's panic reaches the caller");
+        let freed: &[&str] = if live { &["cleanup", "drop", "message drop", "store.remove"] } else { &["message drop", "store.remove"] };
+        assert_eq!(order(), freed, "live {live}: everything is freed before the store is asked");
+        assert!(sched.tasks.get(h.id()).is_none(), "live {live}: the row is removed");
+        assert_eq!(sched.finished, [(h.id(), TaskState::Cancelled)], "live {live}");
+        assert_eq!(drops() - before, if live { 2 } else { 1 }, "live {live}: every copy freed once");
+    }
+}
+
+#[test]
+fn a_panic_from_the_stores_remove_while_a_checkpoint_prunes_comes_after_the_live_copy_is_freed() {
+    let mut sched = flaky();
+    let before = drops();
+    let h = sched.spawn_box(FRAGILE, Fragile::boxed(PENDING, 0), TaskPolicy::default()).unwrap();
+    sched.run_once().unwrap();
+    h.checkpoint(CheckpointReason::Manual).unwrap();
+    sched.run_once().unwrap(); // first checkpoint
+    h.send("arm", IN_CLEANUP | IN_DROP, arm).unwrap();
+    sched.run_once().unwrap(); // restored, armed and polled
+
+    sched.store.panic_on_remove(true);
+    h.checkpoint(CheckpointReason::Manual).unwrap();
+    clear_order();
+    assert!(catch_unwind(AssertUnwindSafe(|| sched.run_once())).is_err(), "remove's panic reaches the caller");
+    assert_eq!(order(), ["cleanup", "drop", "store.remove"], "the live copy is freed before the store is asked");
+    let ckpts: Vec<_> = sched.reclaim_log.iter().map(|r| r.handle.clone().unwrap()).collect();
+    let entry = row(&sched, h.id());
+    assert!(matches!(entry.resident, Resident::Dormant), "the task is dormant");
+    assert_eq!(entry.checkpoint_history, ckpts, "the checkpoint not yet removed stays in its history");
+    assert_eq!(drops() - before, 2, "both copies freed once");
+
+    // A later prune tries it again.
+    sched.store.panic_on_remove(false);
+    h.send("arm", 0, arm).unwrap();
+    sched.run_once().unwrap(); // restored, disarmed and polled
+    h.checkpoint(CheckpointReason::Manual).unwrap();
+    sched.run_once().unwrap();
+    let latest = sched.reclaim_log.last().unwrap().handle.clone().unwrap();
+    assert_eq!(row(&sched, h.id()).checkpoint_history, [latest]);
+    assert!(ckpts.iter().all(|c| !sched.store.holds(c)), "the older checkpoints are removed");
+}
+
+/// Proves the `memory_budget_hint` doc: every message, every wake but `QoS` and
+/// `MemoryPressure`, and every `Yield` gets a poll; a `QoS` or `MemoryPressure` wake reaches
+/// `on_wake` and gets none.
+#[test]
+fn an_over_budget_task_gets_no_poll_for_a_qos_or_memory_pressure_wake_and_one_for_any_other() {
+    for reason in [WakeReason::QoS, WakeReason::MemoryPressure, WakeReason::Manual] {
+        let mut sched = scheduler();
+        let h = sched.spawn_box(COUNTER, Counter::boxed("b", 100), over_budget()).unwrap();
+        sched.run_once().unwrap(); // checkpointed in place of its first poll
+        sched.run_once().unwrap(); // restored and polled for its spawn
+        h.wake(reason.clone()).unwrap();
+        for _ in 0..20 {
+            sched.run_once().unwrap();
+        }
+        let entry = row(&sched, h.id());
+        let gets_a_poll = reason == WakeReason::Manual;
+        assert_eq!(entry.stats.poll_count, if gets_a_poll { 2 } else { 1 }, "{reason:?}");
+        assert_eq!(entry.state, if gets_a_poll { TaskState::Waiting } else { TaskState::Dormant }, "{reason:?}");
+        assert_eq!(entry.stats.last_wake, Some(if gets_a_poll { WakeReason::Resume } else { reason.clone() }), "{reason:?}: on_wake heard it");
+    }
 }

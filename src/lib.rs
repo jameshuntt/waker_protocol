@@ -1,7 +1,8 @@
 //! A task scheduler on [`waker_tables`]: tasks live in a generation-checked slab and are driven
 //! through per-type vtables, with quality-of-service ordering, checkpoints, typed messages and
 //! capitulation (a task surrenders with a stated reason, after a checkpoint, so the work can go
-//! somewhere else). Every reclaim is written to the scheduler's reclaim log.
+//! somewhere else). Every reclaim is written to the scheduler's reclaim log, and every task's
+//! final state to its `finished` list.
 //!
 //! Each task type's vtable records the type it runs: `spawn_box` refuses a key registered for
 //! another type, and a message is delivered only to a task of the type it was written for.

@@ -59,6 +59,10 @@ pub struct ReclaimReport<H> {
 /// `last_wake` is the newest wake the task has been sent, this round's included. If it returns a
 /// plan, the messages and wakes are delivered first, so the checkpoint holds them, and the task is
 /// not polled.
+///
+/// It is not asked about a task restored from a checkpoint until that task has been polled once,
+/// so a plan that holds for the task's whole life (such as the default budget rule) still lets it
+/// run once after every restore.
 pub trait CapitulateStrategy: Send + Sync + 'static {
     /// A plan to capitulate, or `None` to poll as usual.
     fn plan(

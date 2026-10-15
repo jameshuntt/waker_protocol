@@ -52,6 +52,40 @@ or sent a message as its own type:
 `ProtocolTask` is an `unsafe trait`: its functions are called with exclusive access to a live task
 and nothing more, and `restore` must accept any bytes the checkpoint store returns.
 
+## 0.3.2
+
+Fixes from a review of 0.3.1. No public signature changed; `WakerProtocol` has one new public
+field, `finished`.
+
+- **A restored task runs before it can be checkpointed again.** The capitulation strategy is not
+  asked about a task restored from a checkpoint until that task has been polled once, whatever
+  the strategy. In 0.3.1 the default budget rule checkpointed an over-budget Batch or Background
+  task before every poll, including right after each restore, so the task never ran again. Now
+  such a task runs once after each restore.
+- **A dormant task without auto-restore stays dormant.** With `auto_restore_on_wake` off, a wake
+  or a message sent to a dormant task is kept in its row (`pending_wakes`, `mailbox`), and the
+  task stays `Dormant` and out of the ready list. Set `auto_restore_on_wake` back to true in its
+  row, and the next round restores it and delivers them. In 0.3.1 a wake set the task's state to
+  `Runnable`, so it sat in the ready list every round and nothing happened.
+- **A checkpoint the store cannot remove is kept and tried again.** When old checkpoints are
+  pruned and the store's `remove` fails for one, that handle stays in the task's
+  `checkpoint_history`, the error is returned, and the next prune tries it again. In 0.3.1 the
+  handle was already gone from the history, so its bytes stayed in the store for good. When a
+  task ends, its history goes with its row: a removal that fails then is returned as an error but
+  not tried again (the handle is still in `reclaim_log`).
+- **`finished` says how every task ended.** `WakerProtocol::finished` lists every task the
+  scheduler removed, oldest first, with the state it ended in: `Completed`, `Cancelled`, or
+  `Failed` with its message. In 0.3.1 a `Failed` message was lost when the row was removed. Like
+  `reclaim_log` it only grows; clear it once read.
+- **A panic no longer leaves an empty row.** A panic in a task's own `poll`, `on_wake` or
+  `checkpoint` is caught: the task ends as `Failed`, with a message naming the panic
+  (`task panicked in poll: ...`), its checkpoints follow `retain_on_failure`, and its row is
+  removed. A panic from the checkpoint store or the capitulation strategy still reaches the
+  caller, but the task is put back in its row, live, first, so the scheduler still works if the
+  caller catches the panic. In 0.3.1 each of these panics freed the task and left its row as
+  `Resident::Empty` for good.
+- **Tests.** A test for each fix above. Each was run against 0.3.1 first, where it fails.
+
 ## 0.3.1
 
 Fixes from a review of 0.3.0. No public signature changed; the behaviour changes are these.

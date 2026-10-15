@@ -42,7 +42,9 @@ pub enum WakeOrdering {
 #[derive(Debug, Clone)]
 /// What happens to a task's checkpoints.
 pub struct RetentionPolicy {
-    /// How many checkpoints to keep (a dormant task always keeps one).
+    /// How many checkpoints to keep (a dormant task always keeps one). An older checkpoint the
+    /// store fails to remove stays in the task's `checkpoint_history`, beyond this count, and a
+    /// later prune tries it again.
     pub keep_latest: usize,
     /// Keep checkpoints after the task completes.
     pub retain_on_completion: bool,
@@ -68,7 +70,10 @@ impl Default for RetentionPolicy {
 pub struct TaskPolicy {
     /// Priority class.
     pub qos: QoSClass,
-    /// Restore a dormant task when it is woken (the default).
+    /// Restore a dormant task when it is woken (the default). When false, a dormant task stays
+    /// Dormant and is not polled: wakes and messages sent to it are kept in its row
+    /// (`pending_wakes`, `mailbox`). Set it back to true in the task's row, and the next round
+    /// restores the task and delivers them.
     pub auto_restore_on_wake: bool,
     /// After `Yield`, keep the task runnable so the next `run_once` or `pump` polls it again (the
     /// default); a task is polled at most once per round. When false, `Yield` parks the task
@@ -76,7 +81,9 @@ pub struct TaskPolicy {
     pub eager_repoll_after_yield: bool,
     /// Checkpoint retention.
     pub retention: RetentionPolicy,
-    /// Memory budget the default strategy enforces at Batch or lower.
+    /// Memory budget the default strategy enforces at Batch or lower: a task over it is
+    /// checkpointed before a poll, and after each restore it is polled once before the rule can
+    /// checkpoint it again.
     pub memory_budget_hint: Option<usize>,
     /// Reserved: the scheduler does not read it yet.
     pub dormancy_ttl: Option<Duration>,

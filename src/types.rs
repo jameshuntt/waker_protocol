@@ -98,7 +98,8 @@ pub enum TaskState {
     Completed,
     /// Cancelled.
     Cancelled,
-    /// Failed with an error.
+    /// Failed with an error, or with a message naming a panic in the task's own `poll`, `on_wake`
+    /// or `checkpoint`.
     Failed(String),
 }
 

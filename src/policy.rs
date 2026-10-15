@@ -73,9 +73,10 @@ pub struct TaskPolicy {
     /// Restore a dormant task when it is woken (the default). When false, a dormant task stays
     /// Dormant and is not polled: wakes and messages sent to it are kept in its row
     /// (`pending_wakes`, `mailbox`). Set it back to true in the task's row, and the next round
-    /// restores the task and delivers them. A task the capitulation strategy checkpointed in place
-    /// of a poll it had work for is kept the same way, with its state `Runnable`, and polled once
-    /// this is back to true.
+    /// restores the task and delivers them. A task checkpointed while it is owed a poll (by the
+    /// capitulation strategy in place of a poll it had work for, or by a Checkpoint or Capitulate
+    /// message after a `Yield` or work it was not yet polled for) is kept the same way, with its
+    /// state `Runnable`, and polled once this is back to true.
     pub auto_restore_on_wake: bool,
     /// After `Yield`, keep the task runnable so the next `run_once` or `pump` polls it again (the
     /// default); a task is polled at most once per round. When false, `Yield` parks the task
@@ -85,9 +86,10 @@ pub struct TaskPolicy {
     pub retention: RetentionPolicy,
     /// Memory budget the default strategy enforces at Batch or lower: a task over it is
     /// checkpointed in place of a poll, and, if it had work waiting, the next round restores and
-    /// polls it; the rule is not applied to that first poll after a restore. So the task gets one
-    /// poll for every message, every wake other than `QoS` or `MemoryPressure`, and every `Yield`,
-    /// one round later than a task within its budget. A `Yield` keeps its poll even when a `QoS` or
+    /// polls it; the rule is not applied to that first poll after a restore. So every message,
+    /// every wake other than `QoS` or `MemoryPressure`, and every `Yield` is followed by a poll at
+    /// most one round later than for a task within its budget, and work that arrives while the
+    /// task waits for that poll shares it. A `Yield` keeps its poll even when a `QoS` or
     /// `MemoryPressure` wake comes after it, and counts only with `eager_repoll_after_yield`. A
     /// `QoS` or `MemoryPressure` wake with no other work waiting reaches its `on_wake` and is
     /// answered by the checkpoint, with no poll: the task stays dormant until another wake or

@@ -13,6 +13,6 @@ readme = "readme.md"
 exclude = ["waker_protocol.txt", ".vscode/"]
 
 [dependencies]
-waker_tables = "0.3"
+waker_tables = "0.3.1"
 crossbeam-channel = "0.5.15"
 # tokio = { version = "1.44.1", features = ["full"] }

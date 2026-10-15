@@ -276,8 +276,9 @@ fn the_raw_waker_vtable_static_is_a_copy_the_crates_wakers_do_not_carry() {
 fn polls_seen<S: CheckpointStore>(sched: &WakerProtocol<S>, id: TaskId) -> Option<u32> {
     match &sched.tasks.get(id)?.resident {
         Resident::Live(p) if p.vtable().is_for::<Job>() => {
-            // SAFETY: the task is a live `Job` (checked above), only read here, while nothing
-            // else uses it.
+            // SAFETY: the task is a `Job` (checked above) and live: a pointer in a task row is
+            // never empty (`from_raw_parts`' contract). It is only read here, while nothing else
+            // uses it.
             Some(unsafe { (*(p.data() as *const Job)).polls })
         }
         _ => None,

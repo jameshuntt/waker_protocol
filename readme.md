@@ -38,8 +38,8 @@ cargo run --example chaos_test                 # 1000 tasks under wake churn: ea
 
 ## Safety
 
-Tasks run through hand-built vtables, so the crate makes sure a task is only ever run, restored
-or sent a message as its own type:
+Tasks run through hand-built vtables, so the crate makes sure a task is only ever run or sent a
+message as its own type:
 
 - `ProtocolVTable` records the type it was built for, and its fields are private: build it with
   `ProtocolVTable::of::<T>()` or `derive_protocol_task_vtable!`, or from hand-written functions
@@ -50,6 +50,11 @@ or sent a message as its own type:
   error is returned once the round is done.
 - `ProtocolTaskPtr` owns its task and frees it once, when dropped. `into_raw_parts` gives the task
   up instead, and only the `unsafe` `from_raw_parts` pairs a task pointer with a vtable by hand.
+
+A checkpoint is restored as the type of the vtable in the task's row, the public field
+`TaskEntry::vtable`. Code that changes that field decides what the checkpoint is restored as;
+that is sound only because `restore` must accept any bytes. Messages are then checked against
+the type the task was restored as.
 
 `ProtocolTask` is an `unsafe trait`: its functions are called with exclusive access to a live task
 and nothing more, and `restore` must accept any bytes the checkpoint store returns.
@@ -69,17 +74,26 @@ back. No public signature changed. New public items: the field
   task instead of polling it, and the task had work waiting (a message, a wake other than `QoS`
   or `MemoryPressure`, or a `Yield` it has not been polled for, whatever wakes came after it),
   the task stays runnable while dormant: the next round restores it and polls it (with
-  `auto_restore_on_wake` on; with it off, once it is set back to true). So an
-  over-budget Batch task gets one poll for every message, every wake other than `QoS` or
-  `MemoryPressure`, and every `Yield`, a round later than a task within its budget. A `Yield`
-  counts only with `eager_repoll_after_yield` (the default); without it, a task that yields waits
-  for a wake, within its budget or not. Work the task was handed keeps its poll even when the
-  save of the strategy's checkpoint fails or the strategy panics: the task is owed the poll until
-  one runs, so the next strategy checkpoint keeps it runnable too. A task woken only by `QoS` or
-  `MemoryPressure` gets no poll for that wake: its `on_wake` hears it, the checkpoint answers it,
-  and the task stays dormant until its next wake or message, so a memory-pressure reclaim is not
-  undone the round after. In 0.3.1 such a task was left dormant with its work delivered but not
-  acted on, until another wake; a task that yielded and was checkpointed this way never ran again.
+  `auto_restore_on_wake` on; with it off, once it is set back to true). So for an over-budget
+  Batch task, every message, every wake other than `QoS` or `MemoryPressure`, and every `Yield`
+  is followed by a poll at most one round later than for a task within its budget, and work that
+  arrives while the task waits for that poll shares it: sent a message every round, it is polled
+  every other round. A `Yield` counts only with `eager_repoll_after_yield` (the default); without
+  it, a task that yields waits for a wake, within its budget or not. Work the task was handed
+  keeps its poll even when the save of the strategy's checkpoint fails or the strategy panics:
+  the task is owed the poll until one runs, so the next strategy checkpoint keeps it runnable
+  too. A task woken only by `QoS` or `MemoryPressure` gets no poll for that wake: its `on_wake`
+  hears it, the checkpoint answers it, and the task stays dormant until its next wake or message,
+  so a memory-pressure reclaim is not undone the round after. In 0.3.1 such a task was left
+  dormant with its work delivered but not acted on, until another wake; a task that yielded and
+  was checkpointed this way never ran again.
+- **A Checkpoint or Capitulate message keeps a poll the task is owed.** A Checkpoint message, or
+  a Capitulate message that keeps a stub, sent to a task owed a poll (for work it was handed and
+  has not been polled for, or for a `Yield`) checkpoints it as a strategy checkpoint does: the
+  task stays runnable while dormant, and the next round restores it and polls it (with
+  `auto_restore_on_wake` on). That holds as well when the poll is owed because the save of a
+  strategy checkpoint failed or the strategy panicked. In 0.3.1 such a message left a task that
+  had yielded dormant until its next wake.
 - **A dormant task without auto-restore stays dormant.** With `auto_restore_on_wake` off, a wake
   or a message sent to a dormant task is kept in its row (`pending_wakes`, `mailbox`), and the
   task stays `Dormant` and out of the ready list. Set `auto_restore_on_wake` back to true in its
@@ -176,8 +190,9 @@ back. No public signature changed. New public items: the field
     `derive_arc_unsafe_wakeable!` declares. So a waker's vtable compared with this static's
     address is not equal, and a waker built on it does not `will_wake` its own clone; in 0.2.0
     both were true. To recognise a `TaskWakeSignal` waker by its vtable, compare it with
-    `raw_waker_vtable()`. The reason: waker_tables 0.3's `waker_from_arc` takes no vtable, and
-    its derive gives no way to name the static it declares.
+    `raw_waker_vtable()`, which waker_tables has had since 0.3.1; this release requires
+    waker_tables 0.3.1 or later. The reason: waker_tables 0.3's `waker_from_arc` takes no
+    vtable, and its derive gives no way to name the static it declares.
   - `ProtocolTaskPtr::raw_data(&mut self) -> *mut ()`, public again and `unsafe`, as in 0.2.0.
   - `ProtocolVTable`'s functions. In 0.2.0 its fields were public, so safe code could build a
     vtable whose functions read a task as another type. The fields stay private. `poll_fn()`,
@@ -201,8 +216,8 @@ back. No public signature changed. New public items: the field
     (`mem::replace`). 0.3.0 removed that with the public fields. `from_raw_parts` takes a null
     `data` again, for a pointer that owns nothing: dropping it runs nothing, and
     `footprint_estimate`, safe since 0.3.0, returns 0 for it. Such a pointer is never polled,
-    woken, checkpointed, restored into, or put in a task row: `poll`, `on_wake`, `checkpoint`
-    and `raw_data` require a non-null `data`.
+    woken, checkpointed, restored into, or put in a task row: `poll`, `on_wake` and `checkpoint`
+    require a non-null `data`, and so does any use of the pointer `raw_data` returns.
 - **Debug output names the type by its full path.** `{:?}` of a `ProtocolVTable` shows
   `type_name` as `std::any::type_name` gives it (`my_crate::jobs::Job`), where 0.2.0 showed the
   type as written in `derive_protocol_task_vtable!` (`Job`). This changed in 0.3.0 and stays, so
@@ -217,7 +232,8 @@ back. No public signature changed. New public items: the field
   syntax, so an inherent method of the same name ran in place of the trait's whenever method-call
   lookup found it first: for `poll`, `on_wake`, `checkpoint` and `footprint_estimate`, one with
   the same receiver as the trait's (`&mut self`, or `&self` for `footprint_estimate`); for
-  `cleanup`, which it called on the task's `Box`, one with any receiver. Such a method no longer
+  `cleanup`, which it called on the task's `Box`, one whose receiver is `self`, `&self`,
+  `&mut self` or `self: Box<Self>` (not an `Rc`, `Arc` or `Pin` receiver). Such a method no longer
   runs from the scheduler, with no error: move its body into the `ProtocolTask` impl. This
   changed in 0.3.0 and stays, because the vtable runs exactly the functions the type's
   `ProtocolTask` impl declares.

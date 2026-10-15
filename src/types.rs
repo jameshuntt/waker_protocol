@@ -156,14 +156,17 @@ pub enum SchedulerMsg {
         /// The message.
         envelope: EnvelopePacket,
     },
-    /// Checkpoint a task now.
+    /// Checkpoint a task now. A task owed a poll (for a `Yield`, or for work it was handed and not
+    /// yet polled for) stays runnable while dormant: the next round restores it and polls it (with
+    /// `auto_restore_on_wake` on; with it off, once it is set back to true).
     Checkpoint {
         /// The task.
         id: TaskId,
         /// Why.
         reason: CheckpointReason,
     },
-    /// Make a task capitulate now.
+    /// Make a task capitulate now. With a stub, a task owed a poll stays runnable while dormant,
+    /// as after a Checkpoint message.
     Capitulate {
         /// The task.
         id: TaskId,

@@ -12,6 +12,7 @@ const TASK: &str = include_str!("../src/task.rs");
 const WAKE_REF: &str = include_str!("../src/wake_ref.rs");
 const README: &str = include_str!("../readme.md");
 const FROM_0_2: &str = include_str!("from_0_2.rs");
+const CARGO_TOML: &str = include_str!("../Cargo.toml");
 
 const DOC_CLAIMS: &str = include_str!("doc_claims.rs");
 
@@ -142,9 +143,9 @@ fn this_files_header_names_the_draft_as_well() {
 #[test]
 fn the_budget_docs_say_a_qos_or_memory_pressure_wake_gets_no_poll() {
     says(POLICY, "checkpointed in place of a poll, and the next round restores and polls it;", "if it had work waiting, the next round restores and");
-    says(POLICY, "one poll for every wake,", "poll for every message, every wake other than `QoS` or `MemoryPressure`, and every `Yield`,");
+    says(POLICY, "one poll for every wake,", "every wake other than `QoS` or `MemoryPressure`, and every `Yield` is followed by a poll at");
     says(POLICY, "one poll for every wake,", "`on_wake` and is\n    /// answered by the checkpoint, with no poll");
-    says(README, "wake, every message and every `Yield`", "every message, every wake other than `QoS` or\n  `MemoryPressure`, and every `Yield`, a round later");
+    says(README, "wake, every message and every `Yield`", "every message, every wake other than `QoS` or `MemoryPressure`, and every `Yield`\n  is followed by a poll");
 }
 
 /// Proved by `a_panic_in_a_messages_deliver_drops_only_that_message_and_the_round_goes_on` and
@@ -312,7 +313,7 @@ fn the_strategy_docs_say_a_yield_keeps_its_poll_whatever_wakes_come_after_it() {
     let old = "or a `Yield` and no wake since";
     says(CAPITULATE, old, "or a `Yield` it has not been polled for, whatever wakes came after it; a\n/// `Yield` counts only with `eager_repoll_after_yield`");
     says(README, old, "or a `Yield` it has not been polled for, whatever wakes came after it),");
-    tells(README, "A `Yield`\n  counts only with `eager_repoll_after_yield` (the default)");
+    tells(README, "A `Yield` counts only with `eager_repoll_after_yield` (the default); without\n  it, a task that yields waits for a wake");
     says(
         SCHEDULER,
         "with\n    /// nothing waiting, a runnable state (it yielded)",
@@ -367,13 +368,17 @@ fn the_debug_note_says_the_check_compares_type_id_and_a_hand_written_vtable_had_
 /// 0.2.0's expansion is `(&mut *(ptr as *mut $t)).poll()`, `(&*(ptr as *const $t)).footprint_estimate()`
 /// and `Box::from_raw(ptr as *mut $t).cleanup()`; a probe of those calls on types with inherent
 /// methods of each receiver ran the inherent `poll` and `footprint_estimate` only with the trait's
-/// receiver, and the inherent `cleanup` with `self`, `&self` and `&mut self`.
+/// receiver, and the inherent `cleanup` with `self`, `&self`, `&mut self` and `self: Box<Self>`.
+/// A probe of the crates.io 0.2.0 derive itself, on types with an inherent `cleanup` of each
+/// receiver, ran the inherent one for those four and the trait's for `Rc<Self>`, `Arc<Self>` and
+/// `Pin<&mut Self>`.
 #[test]
 fn the_derive_note_says_which_inherent_methods_ran_in_0_2_0() {
+    assert!(!README.contains("one with any receiver"), "still says an inherent `cleanup` with any receiver ran");
     says(
         README,
         "so an inherent method of the same name, when the type had one, ran in\n  place of the trait's.",
-        "for `poll`, `on_wake`, `checkpoint` and `footprint_estimate`, one with\n  the same receiver as the trait's (`&mut self`, or `&self` for `footprint_estimate`); for\n  `cleanup`, which it called on the task's `Box`, one with any receiver.",
+        "for `poll`, `on_wake`, `checkpoint` and `footprint_estimate`, one with\n  the same receiver as the trait's (`&mut self`, or `&self` for `footprint_estimate`); for\n  `cleanup`, which it called on the task's `Box`, one whose receiver is `self`, `&self`,\n  `&mut self` or `self: Box<Self>` (not an `Rc`, `Arc` or `Pin` receiver).",
     );
 }
 
@@ -395,7 +400,7 @@ fn the_docs_say_from_box_drops_a_task_it_refuses_before_it_panics() {
 /// and `work_handed_to_a_task_keeps_its_poll_when_the_strategy_panics`.
 #[test]
 fn the_docs_say_work_a_task_was_handed_keeps_its_poll_when_a_save_fails_or_the_strategy_panics() {
-    tells(README, "Work the task was handed keeps its poll even when the\n  save of the strategy's checkpoint fails or the strategy panics");
+    tells(README, "Work the task was handed\n  keeps its poll even when the save of the strategy's checkpoint fails or the strategy panics:");
     tells(CAPITULATE, "Work the task was handed keeps its\n/// poll even when the save of the plan's checkpoint fails or the strategy panics");
     says(SCHEDULER, "/// Tasks that yielded and have not been polled since.", "/// Tasks owed a poll: each was handed work");
 }
@@ -419,7 +424,11 @@ fn the_docs_say_a_task_the_strategy_checkpointed_waits_for_auto_restore() {
 #[test]
 fn the_docs_say_an_empty_task_pointer_is_back() {
     tells(README, "  - The empty `ProtocolTaskPtr`. In 0.2.0 a `ProtocolTaskPtr` whose `data` was null owned");
-    tells(README, "`poll`, `on_wake`, `checkpoint`\n    and `raw_data` require a non-null `data`.");
+    says(
+        README,
+        "`poll`, `on_wake`, `checkpoint`\n    and `raw_data` require a non-null `data`.",
+        "`poll`, `on_wake` and `checkpoint`\n    require a non-null `data`, and so does any use of the pointer `raw_data` returns.",
+    );
     tells(TASK, "Or `data` is null, for an empty pointer that owns nothing, as 0.2.0's could be");
     tells(TASK, "ProtocolTask's contract for `poll`, and a non-null `data`");
     tells(TASK, "Using the pointer does: it requires a non-null `data`");
@@ -432,4 +441,73 @@ fn the_put_back_notes_say_type_name_reads_the_name_at_run_time_only() {
     tells(README, "`type_name()` reads the name at run time only, because `std::any::type_name` is not `const`\n    on stable");
     tells(README, "a name needed in a\n    `static` now has to be written out by hand.");
     tells(TASK, "It is read at run time only: `std::any::type_name` is not `const` on stable");
+}
+
+// The seventh review of the 0.3.2 draft.
+
+/// Proved by the doctest on `ProtocolTaskPtr::data`, which reads an empty pointer with a `Job`
+/// vtable through the example's own function; the old example read through its null `data`.
+#[test]
+fn the_data_example_checks_the_pointer_is_not_null_before_reading_through_it() {
+    says(
+        TASK,
+        "// SAFETY: the task is a live `Job` (checked above), only read here while nothing writes it.",
+        "A vtable check alone does not prove a task is behind the pointer: an empty pointer's `data`\n    /// is null, whatever its vtable.",
+    );
+    tells(TASK, "if !task.vtable().is_for::<Job>() || task.data().is_null() {");
+    tells(TASK, "assert_eq!(polls(&empty), None, \"a `Job` vtable, but no task behind it\");");
+}
+
+/// Proved by `a_checkpoint_or_capitulate_message_keeps_the_poll_a_task_is_owed_for_its_yield` and
+/// the two `work_handed_to_a_task_keeps_its_poll_...` tests, which follow the round that went
+/// wrong with a Checkpoint or a Capitulate message; what 0.3.1 did, by the same Yield case run
+/// against 0.3.1's code.
+#[test]
+fn the_docs_say_a_checkpoint_or_capitulate_message_keeps_a_poll_the_task_is_owed() {
+    tells(README, "**A Checkpoint or Capitulate message keeps a poll the task is owed.**");
+    tells(README, "In 0.3.1 such a message left a task that\n  had yielded dormant until its next wake.");
+    tells(TYPES, "/// Checkpoint a task now. A task owed a poll (for a `Yield`, or for work it was handed and not\n    /// yet polled for) stays runnable while dormant");
+    tells(CAPITULATE, "a later plan\n/// that checkpoints the task, or a Checkpoint or Capitulate message, keeps it runnable too.");
+    tells(POLICY, "or by a Checkpoint or Capitulate\n    /// message after a `Yield` or work it was not yet polled for) is kept the same way");
+    says(
+        SCHEDULER,
+        "so a\n    /// strategy checkpoint keeps it runnable, even after",
+        "so a\n    /// checkpoint (the strategy's, or one a Checkpoint or Capitulate message asks for) keeps it\n    /// runnable",
+    );
+}
+
+/// Proved by `an_over_budget_task_sent_a_message_every_round_polls_within_a_round_of_each`.
+#[test]
+fn the_budget_docs_say_work_that_arrives_while_a_poll_is_owed_shares_it() {
+    says(
+        README,
+        "gets one poll for every message",
+        "and work that\n  arrives while the task waits for that poll shares it: sent a message every round, it is polled\n  every other round.",
+    );
+    says(
+        POLICY,
+        "So the task gets one\n    /// poll for every message",
+        "is followed by a poll at\n    /// most one round later than for a task within its budget, and work that arrives while the\n    /// task waits for that poll shares it.",
+    );
+}
+
+/// Proved by `a_checkpoint_is_restored_as_the_type_of_the_vtable_in_its_row`.
+#[test]
+fn the_safety_notes_say_the_rows_vtable_decides_what_a_checkpoint_is_restored_as() {
+    says(
+        README,
+        "so the crate makes sure a task is only ever run, restored\nor sent a message as its own type",
+        "so the crate makes sure a task is only ever run or sent a\nmessage as its own type:",
+    );
+    tells(README, "A checkpoint is restored as the type of the vtable in the task's row, the public field\n`TaskEntry::vtable`.");
+    tells(README, "that is sound only because `restore` must accept any bytes.");
+    says(SCHEDULER, "/// Its type's vtable, used to restore it.", "Code that changes this field decides what the checkpoint is restored as");
+}
+
+/// `cargo update -p waker_tables --precise 0.3.0` is refused once the requirement is 0.3.1; with
+/// "0.3" it was accepted, and tests/from_0_2.rs then failed to compile (no `raw_waker_vtable`).
+#[test]
+fn the_manifest_requires_the_waker_tables_that_has_raw_waker_vtable() {
+    says(CARGO_TOML, "waker_tables = \"0.3\"\n", "waker_tables = \"0.3.1\"\n");
+    tells(README, "`raw_waker_vtable()`, which waker_tables has had since 0.3.1; this release requires\n    waker_tables 0.3.1 or later.");
 }

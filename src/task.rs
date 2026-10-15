@@ -455,6 +455,8 @@ impl ProtocolTaskPtr {
     /// The raw task pointer, read through a shared reference, as 0.2.0's public `data` field could
     /// be; null for an empty pointer. The task stays owned by this `ProtocolTaskPtr`. Reading the
     /// pointer is safe; using it is `unsafe`, under the rules [`raw_data`](Self::raw_data) states.
+    /// A vtable check alone does not prove a task is behind the pointer: an empty pointer's `data`
+    /// is null, whatever its vtable.
     ///
     /// ```
     /// # use waker_protocol::{derive_protocol_task_vtable, ProtocolTask, ProtocolTaskPtr, TaskPoll};
@@ -466,14 +468,21 @@ impl ProtocolTaskPtr {
     /// # }
     /// derive_protocol_task_vtable!(Job, JOB_VTABLE);
     ///
-    /// fn polls(task: &ProtocolTaskPtr) -> u32 {
-    ///     assert!(task.vtable().is_for::<Job>());
-    ///     // SAFETY: the task is a live `Job` (checked above), only read here while nothing writes it.
-    ///     unsafe { (*(task.data() as *const Job)).polls }
+    /// /// The polls of the `Job` behind `task`; `None` for another type or an empty pointer.
+    /// fn polls(task: &ProtocolTaskPtr) -> Option<u32> {
+    ///     if !task.vtable().is_for::<Job>() || task.data().is_null() {
+    ///         return None;
+    ///     }
+    ///     // SAFETY: `data` is not null, so a live task is behind it, and it is a `Job` (both
+    ///     // checked above); it is only read here, while nothing writes it.
+    ///     Some(unsafe { (*(task.data() as *const Job)).polls })
     /// }
     ///
     /// let task = ProtocolTaskPtr::from_box(Box::new(Job { polls: 3 }), &JOB_VTABLE);
-    /// assert_eq!(polls(&task), 3);
+    /// assert_eq!(polls(&task), Some(3));
+    /// // SAFETY: a null `data` makes an empty pointer; it is only read and dropped here.
+    /// let empty = unsafe { ProtocolTaskPtr::from_raw_parts(std::ptr::null_mut(), &JOB_VTABLE) };
+    /// assert_eq!(polls(&empty), None, "a `Job` vtable, but no task behind it");
     /// ```
     pub fn data(&self) -> *mut () {
         self.data

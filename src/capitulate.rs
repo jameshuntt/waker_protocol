@@ -68,8 +68,9 @@ pub struct ReclaimReport<H> {
 /// round restores and polls it (with `auto_restore_on_wake` on; with it off, once it is set back
 /// to true), so the plan puts the poll off but never drops it. Work the task was handed keeps its
 /// poll even when the save of the plan's checkpoint fails or the strategy panics: a later plan
-/// that checkpoints the task keeps it runnable too. A task woken only by `QoS` or
-/// `MemoryPressure` is answered by the checkpoint and stays dormant until its next wake.
+/// that checkpoints the task, or a Checkpoint or Capitulate message, keeps it runnable too. A
+/// task woken only by `QoS` or `MemoryPressure` is answered by the checkpoint and stays dormant
+/// until its next wake.
 ///
 /// It is not asked about a task restored from a checkpoint until that task has been polled once,
 /// so a plan that holds for the task's whole life (such as the default budget rule) still lets it

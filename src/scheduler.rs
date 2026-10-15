@@ -60,7 +60,9 @@ pub enum Resident {
 pub struct TaskEntry<H> {
     /// The key it was spawned under.
     pub key: VTableKey,
-    /// Its type's vtable, used to restore it.
+    /// Its type's vtable, from spawn; its checkpoint is restored as the type of the vtable here.
+    /// Code that changes this field decides what the checkpoint is restored as, which is sound
+    /// only because `restore` must accept any bytes; messages are then checked against that type.
     pub vtable: &'static ProtocolVTable,
     /// Where its memory is.
     pub resident: Resident,
@@ -274,11 +276,11 @@ enum Settle {
     /// Live in its row and runnable, behind the tasks already waiting to run: it yielded, and is
     /// owed a poll.
     RunAgain,
-    /// Checkpointed and dormant, restored when woken.
+    /// Checkpointed and dormant. A task `owed` a poll stays runnable, so the next round that polls
+    /// restores and polls it (after Shutdown, none does): a checkpoint puts that poll off but never
+    /// drops it, whether the strategy, a Checkpoint or Capitulate message, or Shutdown asked for
+    /// it. Any other task is restored when woken.
     Checkpoint(CheckpointReason),
-    /// Checkpointed in place of a poll the task had work for: dormant but runnable, so the next
-    /// round restores and polls it.
-    CheckpointAndRunAgain(CheckpointReason),
     /// Ended in this state and removed; its checkpoints follow the retention policy.
     Finish(TaskState),
 }
@@ -290,15 +292,6 @@ impl Settle {
             Self::Checkpoint(plan.reason)
         } else {
             Self::Finish(TaskState::Completed)
-        }
-    }
-
-    /// A strategy's plan, carried out in place of a poll. A task it checkpoints that had work
-    /// waiting stays runnable, so the plan puts the poll off to the next round but never drops it.
-    fn in_place_of_poll(plan: CapitulatePlan, had_work: bool) -> Self {
-        match Self::capitulate(plan) {
-            Self::Checkpoint(reason) if had_work => Self::CheckpointAndRunAgain(reason),
-            settle => settle,
         }
     }
 
@@ -486,8 +479,9 @@ pub struct WakerProtocol<S: CheckpointStore> {
     /// Tasks owed a poll: each was handed work (a message, or a wake other than `QoS` or
     /// `MemoryPressure`) it has not been polled for since, or yielded with
     /// `eager_repoll_after_yield`. A task leaves the set only when its poll runs or it ends, so a
-    /// strategy checkpoint keeps it runnable, even after a `QoS` or `MemoryPressure` wake, a save
-    /// of that checkpoint that failed, or a strategy that panicked.
+    /// checkpoint (the strategy's, or one a Checkpoint or Capitulate message asks for) keeps it
+    /// runnable, even after a `QoS` or `MemoryPressure` wake, a save of an earlier checkpoint that
+    /// failed, or a strategy that panicked.
     owed: HashSet<TaskId>,
     tx: Sender<SchedulerMsg>,
     rx: Receiver<SchedulerMsg>,
@@ -866,8 +860,10 @@ impl<S: CheckpointStore> WakerProtocol<S> {
                     break 'settle Settle::Finish(TaskState::Failed(panic));
                 }
             }
+            // A task with work is `owed` its poll now, so a plan that checkpoints it keeps it
+            // runnable (see `Settle::Checkpoint`).
             if let Some(plan) = snapshot.and_then(|snapshot| self.strategy.plan(&snapshot, last_wake.as_ref())) {
-                break 'settle Settle::in_place_of_poll(plan, had_work);
+                break 'settle Settle::capitulate(plan);
             }
 
             self.restored.remove(&id);
@@ -898,7 +894,7 @@ impl<S: CheckpointStore> WakerProtocol<S> {
             // Dormant: its checkpoint is already in the store, so only Finish changes anything.
             return match settle {
                 Settle::Finish(state) => self.finish(id, state, None),
-                Settle::Wait | Settle::RunAgain | Settle::Checkpoint(_) | Settle::CheckpointAndRunAgain(_) => Ok(()),
+                Settle::Wait | Settle::RunAgain | Settle::Checkpoint(_) => Ok(()),
             };
         };
 
@@ -909,8 +905,10 @@ impl<S: CheckpointStore> WakerProtocol<S> {
                 self.owed.insert(id);
                 self.put_back(id, live, TaskState::Runnable, Some(seq))
             }
-            Settle::Checkpoint(reason) => self.checkpoint_live(id, live, reason, false),
-            Settle::CheckpointAndRunAgain(reason) => self.checkpoint_live(id, live, reason, true),
+            Settle::Checkpoint(reason) => {
+                let owed = self.owed.contains(&id);
+                self.checkpoint_live(id, live, reason, owed)
+            }
             Settle::Finish(state) => self.finish(id, state, Some(live)),
         }
     }

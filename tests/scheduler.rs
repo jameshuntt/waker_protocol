@@ -413,9 +413,52 @@ fn slab_ids_go_stale_when_a_slot_is_reused() {
     assert_eq!(b.slot, a.slot);
     assert_ne!(b.generation, a.generation);
     assert_eq!(slab.get(a), None, "the old id cannot reach the new value");
+    assert_eq!(slab.get_mut(a), None, "nor change it");
+    assert_eq!(slab.remove(a), None, "nor take it out");
+    assert_eq!(slab.get(b), Some(&"b"), "the new value is still there");
     assert_eq!(slab.get_mut(b), Some(&mut "b"));
     let c = slab.insert("c");
     assert_eq!(slab.live_ids(), vec![b, c]);
+}
+
+/// A task spawned into a reused slot is out of reach of the old task's handle. Fails if the slab's
+/// `get_mut` or `remove` ignores the generation.
+#[test]
+fn a_stale_handle_never_reaches_the_task_that_reuses_its_slot() {
+    let mut sched = scheduler();
+    let before = drops();
+    let old = sched.spawn_box(COUNTER, Counter::boxed("old", 100), TaskPolicy::default()).unwrap();
+    sched.run_once().unwrap();
+    old.cancel().unwrap();
+    sched.run_once().unwrap();
+    let new = sched.spawn_box(COUNTER, Counter::boxed("new", 100), TaskPolicy::default()).unwrap();
+    assert_eq!(new.id().slot, old.id().slot, "the slot is reused");
+    assert_ne!(new.id(), old.id());
+    sched.run_once().unwrap(); // polled for its spawn
+    clear_order();
+
+    let plan = |retain_stub| CapitulatePlan { reason: CheckpointReason::QoS, retain_stub };
+    for what in ["wake", "send", "checkpoint", "capitulate with a stub", "capitulate without a stub", "cancel"] {
+        match what {
+            "wake" => old.wake(WakeReason::Manual),
+            "send" => old.send("note", "stale", note),
+            "checkpoint" => old.checkpoint(CheckpointReason::Manual),
+            "capitulate with a stub" => old.capitulate(plan(true)),
+            "capitulate without a stub" => old.capitulate(plan(false)),
+            _ => old.cancel(),
+        }
+        .unwrap();
+        sched.run_once().unwrap();
+        let entry = sched.tasks.get(new.id()).unwrap_or_else(|| panic!("{what}: the new task's row is gone"));
+        assert!(matches!(entry.resident, Resident::Live(_)), "{what}: the new task is live");
+        assert_eq!(entry.state, TaskState::Waiting, "{what}");
+        assert_eq!((entry.stats.poll_count, entry.stats.checkpoint_count), (1, 0), "{what}: not polled or checkpointed for it");
+        assert!(entry.mailbox.is_empty() && entry.pending_wakes.is_empty(), "{what}: nothing queued for it");
+        assert_eq!(sched.finished, [(old.id(), TaskState::Cancelled)], "{what}: only the old task ended");
+        assert!(order().is_empty(), "{what}: nothing was delivered or polled");
+        assert!(sched.reclaim_log.is_empty(), "{what}");
+        assert_eq!(drops() - before, 1, "{what}: only the old task was freed");
+    }
 }
 
 #[test]
@@ -2264,18 +2307,31 @@ impl CapitulateStrategy for PanicOnce {
     }
 }
 
+/// What follows the round whose strategy checkpoint went wrong.
+#[derive(Clone, Copy, Debug)]
+enum Then {
+    /// Nothing: the strategy checkpoints the task again.
+    Nothing,
+    /// A Checkpoint message.
+    CheckpointMessage,
+    /// A Capitulate message that keeps a stub.
+    CapitulateMessage,
+}
+
 /// Hand an over-budget Counter, polled once, a message ("job") or a Manual wake. In the round that
 /// delivers it, `fault` makes the strategy's checkpoint fail, or panic, in place of the poll.
 /// Check that the task is live, its work handed over and not yet polled for; then, with nothing
-/// failing, that the next strategy checkpoint happens and the round after it polls the task.
+/// failing, that the next checkpoint (the strategy's, or one a Checkpoint or Capitulate message
+/// asks for) happens and keeps the task runnable, so a round polls it.
 fn handed_work_survives<S: CheckpointStore>(
     mut sched: WakerProtocol<S>,
     fault: impl Fn(&WakerProtocol<S>, bool),
     expect_panic: bool,
     case: &str,
 ) {
-    for message in [false, true] {
-        let case = format!("{case}, message {message}");
+    let thens = [Then::Nothing, Then::CheckpointMessage, Then::CapitulateMessage];
+    for (then, message) in thens.into_iter().flat_map(|then| [(then, false), (then, true)]) {
+        let case = format!("{case}, message {message}, then {then:?}");
         let before = drops();
         let h = sched.spawn_box(COUNTER, Counter::boxed("b", 100), over_budget()).unwrap();
         sched.run_once().unwrap(); // checkpointed in place of its first poll
@@ -2301,12 +2357,19 @@ fn handed_work_survives<S: CheckpointStore>(
         assert_eq!(entry.stats.poll_count, 1, "{case}: and it was not polled for it");
 
         let saved = sched.reclaim_log.len();
+        match then {
+            Then::Nothing => {}
+            Then::CheckpointMessage => h.checkpoint(CheckpointReason::Manual).unwrap(),
+            Then::CapitulateMessage => {
+                h.capitulate(CapitulatePlan { reason: CheckpointReason::QoS, retain_stub: true }).unwrap()
+            }
+        }
         for _ in 0..5 {
             sched.run_once().unwrap();
         }
         let entry = row(&sched, h.id());
-        assert_eq!(sched.reclaim_log.len(), saved + 1, "{case}: the strategy checkpointed it again in place of the poll");
-        assert_eq!(entry.stats.poll_count, 2, "{case}: and the round after that polled it");
+        assert_eq!(sched.reclaim_log.len(), saved + 1, "{case}: it was checkpointed once more before the poll");
+        assert_eq!(entry.stats.poll_count, 2, "{case}: and then a round polled it");
         assert_eq!(entry.state, TaskState::Waiting, "{case}");
         let acted: &[&str] = if message { &["job", "restored"] } else { &["restored"] };
         let order: Vec<_> = order().into_iter().filter(|step| *step != "store.remove").collect();
@@ -2439,4 +2502,168 @@ fn a_destroy_function_that_holds_the_panics_keeps_a_drop_during_an_unwind_from_a
     assert_eq!(payload.downcast_ref::<&str>(), Some(&"outer"), "and nothing else");
     assert_eq!(order(), ["cleanup", "drop"], "both panicked while the outer panic unwound");
     assert_eq!(drops() - before, 1, "the task is freed once");
+}
+
+// ---------------------------------------------------------------------------------------------
+// 0.3.2, seventh review: a Checkpoint or Capitulate message keeps a poll the task is owed; an
+// over-budget task sent work every round; the row's vtable decides what a checkpoint is restored
+// as; every `SchedulerHandle` method.
+
+/// A task that yielded is owed its next poll. Fails if a Checkpoint message, or a Capitulate
+/// message that keeps a stub, leaves it dormant until a wake. Without auto-restore the task waits,
+/// runnable, until auto-restore is back.
+#[test]
+fn a_checkpoint_or_capitulate_message_keeps_the_poll_a_task_is_owed_for_its_yield() {
+    for (capitulate, auto_restore) in [(false, true), (true, true), (false, false), (true, false)] {
+        let case = format!("capitulate {capitulate}, auto-restore {auto_restore}");
+        let mut sched = scheduler();
+        let policy = TaskPolicy { auto_restore_on_wake: auto_restore, ..TaskPolicy::default() };
+        let h = sched.spawn_box(SCRIPTED, Scripted::boxed(64, &[YIELD, YIELD, READY]), policy).unwrap();
+        sched.run_once().unwrap(); // polled: it yields
+        assert_eq!(row(&sched, h.id()).state, TaskState::Runnable, "{case}: owed a poll");
+
+        if capitulate {
+            h.capitulate(CapitulatePlan { reason: CheckpointReason::QoS, retain_stub: true }).unwrap();
+        } else {
+            h.checkpoint(CheckpointReason::Manual).unwrap();
+        }
+        sched.run_once().unwrap();
+        if !auto_restore {
+            for _ in 0..3 {
+                sched.run_once().unwrap();
+            }
+            let entry = row(&sched, h.id());
+            assert!(matches!(entry.resident, Resident::Dormant), "{case}: checkpointed");
+            assert_eq!(entry.state, TaskState::Runnable, "{case}: and still owed its poll");
+            assert_eq!((entry.stats.restore_count, entry.stats.poll_count), (0, 1), "{case}: not restored yet");
+            sched.tasks.get_mut(h.id()).unwrap().policy.auto_restore_on_wake = true;
+            sched.run_once().unwrap();
+        }
+        let entry = row(&sched, h.id());
+        assert_eq!(entry.stats.checkpoint_count, 1, "{case}: the message checkpointed it");
+        assert_eq!(entry.stats.restore_count, 1, "{case}: and a round restored it");
+        assert_eq!(entry.stats.poll_count, 2, "{case}: and polled it for its Yield");
+
+        for _ in 0..5 {
+            sched.run_once().unwrap();
+        }
+        assert_eq!(sched.finished, [(h.id(), TaskState::Completed)], "{case}: every Yield got its poll");
+    }
+}
+
+/// Polls an over-budget Batch Counter and one within its budget get for a message sent before
+/// every round, round by round. Each message is followed by a poll in its round or the next; the
+/// over-budget task's message that arrives while it waits for that poll shares it.
+#[test]
+fn an_over_budget_task_sent_a_message_every_round_polls_within_a_round_of_each() {
+    let mut polls = Vec::new();
+    let mut orders = Vec::new();
+    for budget in [None, Some(0)] {
+        let mut sched = scheduler();
+        let policy = TaskPolicy { memory_budget_hint: budget, ..over_budget() };
+        let h = sched.spawn_box(COUNTER, Counter::boxed("w", 100), policy).unwrap();
+        for _ in 0..3 {
+            sched.run_once().unwrap();
+        }
+        let start = row(&sched, h.id()).stats.poll_count;
+        assert_eq!((start, &row(&sched, h.id()).state), (1, &TaskState::Waiting), "{budget:?}: polled for its spawn");
+        clear_order();
+
+        let mut seen = Vec::new();
+        for _ in 0..8 {
+            h.send("note", "job", note).unwrap();
+            sched.run_once().unwrap();
+            seen.push(row(&sched, h.id()).stats.poll_count - start);
+        }
+        sched.run_once().unwrap();
+        seen.push(row(&sched, h.id()).stats.poll_count - start);
+        // Message `i` is sent before round `i`: a poll follows it by the end of round `i + 1`.
+        for i in 0..8 {
+            let before = if i == 0 { 0 } else { seen[i - 1] };
+            assert!(seen[i + 1] > before, "{budget:?}: message {i} waits more than a round: {seen:?}");
+        }
+        polls.push(seen);
+        orders.push(order().into_iter().filter(|step| *step != "store.remove").collect::<Vec<_>>());
+    }
+    assert_eq!(polls[0], [1, 2, 3, 4, 5, 6, 7, 8, 8], "within budget, a poll in each message's own round");
+    assert_eq!(polls[1], [0, 1, 1, 2, 2, 3, 3, 4, 4], "over budget, two messages share each poll");
+    assert_eq!(orders[1], ["job", "job", "restored"].repeat(4), "each message delivered once, then a poll");
+}
+
+/// The row's public `vtable` decides what a checkpoint is restored as: safe code that changes it
+/// gets the bytes restored as another type, which is sound because `restore` accepts any bytes. A
+/// message is still checked against the type the task now is.
+#[test]
+fn a_checkpoint_is_restored_as_the_type_of_the_vtable_in_its_row() {
+    let mut sched = scheduler();
+    let before = drops();
+    let h = sched.spawn_box(COUNTER, Counter::boxed("v", 100), TaskPolicy::default()).unwrap();
+    sched.run_once().unwrap();
+    h.checkpoint(CheckpointReason::Manual).unwrap();
+    sched.run_once().unwrap();
+    assert_eq!(drops() - before, 1, "the Counter is freed at its checkpoint");
+
+    sched.tasks.get_mut(h.id()).unwrap().vtable = &OTHER_VTABLE;
+    h.wake(WakeReason::Manual).unwrap();
+    sched.run_once().unwrap();
+    let Resident::Live(live) = &row(&sched, h.id()).resident else { panic!("the wake restored it") };
+    assert!(live.vtable().is_for::<Other>(), "the Counter's checkpoint was restored as an Other");
+
+    clear_order();
+    h.send("note", "for a Counter", note).unwrap();
+    let err = sched.run_once().unwrap_err();
+    assert!(err.contains("targets another task type than scheduler::Other"), "{err}");
+    assert!(order().is_empty(), "the Counter's message is refused, not delivered to the Other");
+    assert_eq!(drops() - before, 1, "no Counter was made from the bytes");
+}
+
+/// Each `SchedulerHandle` method reaches its task by id and does what its doc says. Fails if
+/// `checkpoint`, `capitulate` or `cancel` sends another message.
+#[test]
+fn every_scheduler_handle_method_reaches_its_task_by_id() {
+    let mut sched = scheduler();
+    let before = drops();
+    let mut spawn = |name| sched.spawn_box(COUNTER, Counter::boxed(name, 100), TaskPolicy::default()).unwrap().id();
+    let (kept, stub, gone, cancelled) = (spawn("kept"), spawn("stub"), spawn("gone"), spawn("cancelled"));
+    sched.run_once().unwrap();
+
+    let handle = sched.handle();
+    handle.checkpoint(kept, CheckpointReason::Manual).unwrap();
+    handle.capitulate(stub, CapitulatePlan { reason: CheckpointReason::QoS, retain_stub: true }).unwrap();
+    handle.capitulate(gone, CapitulatePlan { reason: CheckpointReason::Stall, retain_stub: false }).unwrap();
+    handle.cancel(cancelled).unwrap();
+    sched.run_once().unwrap();
+
+    for id in [kept, stub] {
+        let entry = row(&sched, id);
+        assert!(matches!(entry.resident, Resident::Dormant), "{id:?}: checkpointed");
+        assert_eq!(entry.state, TaskState::Dormant, "{id:?}");
+        assert_eq!((entry.stats.poll_count, entry.stats.checkpoint_count), (1, 1), "{id:?}: not polled for it");
+    }
+    let reclaims: Vec<_> = sched.reclaim_log.iter().map(|r| (r.id, r.reason.clone())).collect();
+    assert_eq!(reclaims, [(kept, CheckpointReason::Manual), (stub, CheckpointReason::QoS)], "one reclaim each");
+    assert_eq!(sched.finished, [(gone, TaskState::Completed), (cancelled, TaskState::Cancelled)]);
+    assert!(sched.tasks.get(gone).is_none() && sched.tasks.get(cancelled).is_none(), "both rows removed");
+    assert_eq!(drops() - before, 4, "each live copy freed once");
+}
+
+/// Fails if `spawn_interval_waker` wakes with another reason, or its thread outlives the scheduler.
+#[test]
+fn spawn_interval_waker_wakes_its_task_with_timer_until_the_scheduler_is_gone() {
+    let mut sched = scheduler();
+    let h = sched.spawn_box(COUNTER, Counter::boxed("t", 1000), TaskPolicy::default()).unwrap();
+    sched.run_once().unwrap();
+    assert_eq!(row(&sched, h.id()).stats.last_wake, Some(WakeReason::Spawn));
+
+    let ticker = sched.handle().spawn_interval_waker(h.id(), Duration::from_millis(2));
+    let mut rounds = 0;
+    while row(&sched, h.id()).stats.last_wake != Some(WakeReason::Timer) {
+        rounds += 1;
+        assert!(rounds < 1000, "no Timer wake came");
+        sched.pump(Duration::from_millis(10)).unwrap();
+    }
+    assert!(row(&sched, h.id()).stats.poll_count >= 2, "and the wake brought a poll");
+
+    drop(sched);
+    ticker.join().expect("the thread ends once the scheduler is gone");
 }

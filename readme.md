@@ -67,14 +67,16 @@ back. No public signature changed. New public items: the field
   task before every poll, including right after each restore, so the task never ran again.
 - **A strategy checkpoint puts a poll off; it never drops it.** When the strategy checkpoints a
   task instead of polling it, and the task had work waiting (a message, a wake other than `QoS`
-  or `MemoryPressure`, or a `Yield` and no wake since), the task stays runnable while dormant:
-  the next round restores it and polls it. So an over-budget Batch task gets one poll for every
-  message, every wake other than `QoS` or `MemoryPressure`, and every `Yield`, a round later
-  than a task within its budget. A task woken only by `QoS` or `MemoryPressure` gets no poll for
-  that wake: its `on_wake` hears it, the checkpoint answers it, and the task stays dormant until
-  its next wake or message, so a memory-pressure reclaim is not undone the round after. In 0.3.1
-  such a task was left dormant with its work delivered but not acted on, until another wake; a
-  task that yielded and was checkpointed this way never ran again.
+  or `MemoryPressure`, or a `Yield` it has not been polled for, whatever wakes came after it),
+  the task stays runnable while dormant: the next round restores it and polls it. So an
+  over-budget Batch task gets one poll for every message, every wake other than `QoS` or
+  `MemoryPressure`, and every `Yield`, a round later than a task within its budget. A `Yield`
+  counts only with `eager_repoll_after_yield` (the default); without it, a task that yields waits
+  for a wake, within its budget or not. A task woken only by `QoS` or `MemoryPressure` gets no
+  poll for that wake: its `on_wake` hears it, the checkpoint answers it, and the task stays
+  dormant until its next wake or message, so a memory-pressure reclaim is not undone the round
+  after. In 0.3.1 such a task was left dormant with its work delivered but not acted on, until
+  another wake; a task that yielded and was checkpointed this way never ran again.
 - **A dormant task without auto-restore stays dormant.** With `auto_restore_on_wake` off, a wake
   or a message sent to a dormant task is kept in its row (`pending_wakes`, `mailbox`), and the
   task stays `Dormant` and out of the ready list. Set `auto_restore_on_wake` back to true in its
@@ -117,15 +119,25 @@ back. No public signature changed. New public items: the field
   refused. And with a vtable from `ProtocolVTable::of` or `derive_protocol_task_vtable!`, when
   `cleanup` panics, the task's own drop now runs after that panic is caught, not while it
   unwinds, so a panic in the drop as well no longer aborts the process; that holds wherever a
-  `ProtocolTaskPtr` with such a vtable is dropped. A vtable from `ProtocolVTable::from_raw_parts`
-  gets the same only if its destroy function holds a `cleanup` panic until the task is dropped;
-  one written as 0.2.0's macro wrote it (`Box::from_raw`, then `cleanup()`) still aborts when
-  both panic. In 0.3.1 a panic in `cleanup` or `Drop` reached the caller and left the task's row
-  as `Resident::Empty` for good (after a checkpoint, with the saved checkpoint left out of the
+  `ProtocolTaskPtr` with such a vtable is dropped outside an unwind. A vtable from
+  `ProtocolVTable::from_raw_parts` gets the same only if its destroy function holds a `cleanup`
+  panic until the task is dropped; one written as 0.2.0's macro wrote it (`Box::from_raw`, then
+  `cleanup()`) still aborts when both panic. A `ProtocolTaskPtr` dropped while another panic
+  unwinds (by a scheduler dropped during a panic, say) aborts the process if its `cleanup` or its
+  drop panics, whatever its vtable, as any value whose drop panics during an unwind does. In
+  0.3.1 a panic in `cleanup` or `Drop` reached the caller and left the task's row as
+  `Resident::Empty` for good (after a checkpoint, with the saved checkpoint left out of the
   task's history); a panic in a queued message's drop reached the caller with the row removed
   and the task's checkpoints left in the store; a panic in the drop of a message sent to a task
   that had ended reached the caller, and the round's other errors and the rest of the round were
-  lost; and a panic in both `cleanup` and `Drop` aborted the process.
+  lost; a panic in the drop of a refused message reached the caller and left the task's row as
+  `Resident::Empty` for good; and a panic in both `cleanup` and `Drop` aborted the process.
+- **`ProtocolTaskPtr::from_box` drops a task it refuses before it panics.** Given a vtable for
+  another type, `from_box` now drops the task and then panics, as its docs already said; a panic
+  in the task's drop is caught and named in that panic's message (`...; the task panicked as it
+  was dropped: ...`). In 0.3.0 and 0.3.1 it panicked first and dropped the task while that panic
+  unwound, so a task whose drop panicked aborted the process. `spawn_box` was not affected: it
+  checks the vtable first and returns `Err`.
 - **What a panic from the checkpoint store leaves.** A panic from the store's `save` or from the
   capitulation strategy still reaches the caller, but the task is put back in its row, live,
   first, so the scheduler still works if the caller catches the panic. A panic from the store's
@@ -178,16 +190,22 @@ back. No public signature changed. New public items: the field
     gives both back without freeing the task.
 - **Debug output names the type by its full path.** `{:?}` of a `ProtocolVTable` shows
   `type_name` as `std::any::type_name` gives it (`my_crate::jobs::Job`), where 0.2.0 showed the
-  type as written in `derive_protocol_task_vtable!` (`Job`). This changed in 0.3.0 and stays: it
-  is the same value the vtable's type check uses. `ProtocolTaskPtr`'s `{:?}`, new in 0.3.0, shows
-  the same full path.
+  type as written in `derive_protocol_task_vtable!` (`Job`). This changed in 0.3.0 and stays, so
+  a vtable's name is always that of the type it records. A vtable written by hand in 0.2.0
+  carried whatever name its `type_name` field was given; `ProtocolVTable::from_raw_parts::<T>`
+  records `std::any::type_name::<T>()` and takes no name. The type check itself compares
+  `TypeId`; the name is what its error messages print. `ProtocolTaskPtr`'s `{:?}`, new in 0.3.0,
+  shows the same full path.
 - **`derive_protocol_task_vtable!` calls the `ProtocolTask` functions.** Since 0.3.0 it expands
   to `ProtocolVTable::of::<T>()`, whose functions call the trait's `poll`, `on_wake`,
   `checkpoint`, `cleanup` and `footprint_estimate`. 0.2.0's expansion called them with method
-  syntax on the type, so an inherent method of the same name, when the type had one, ran in
-  place of the trait's. Such a method no longer runs from the scheduler, with no error: move its
-  body into the `ProtocolTask` impl. This changed in 0.3.0 and stays, because the vtable runs
-  exactly the functions the type's `ProtocolTask` impl declares.
+  syntax, so an inherent method of the same name ran in place of the trait's whenever method-call
+  lookup found it first: for `poll`, `on_wake`, `checkpoint` and `footprint_estimate`, one with
+  the same receiver as the trait's (`&mut self`, or `&self` for `footprint_estimate`); for
+  `cleanup`, which it called on the task's `Box`, one with any receiver. Such a method no longer
+  runs from the scheduler, with no error: move its body into the `ProtocolTask` impl. This
+  changed in 0.3.0 and stays, because the vtable runs exactly the functions the type's
+  `ProtocolTask` impl declares.
 - **Tests.** A test for each fix above, each run against the code before the fix first, where it
   fails: 0.3.1's code, or the draft's for a fix to the draft. A fix to the docs alone has its test
   in `tests/doc_claims.rs`, which checks that the old sentence is gone and the new one is there.

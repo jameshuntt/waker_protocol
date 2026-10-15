@@ -1,4 +1,4 @@
-use crate::unwind::drop_payload;
+use crate::unwind::{catch, drop_payload};
 use crate::{TaskPoll, WakeReason};
 use std::any::TypeId;
 use std::fmt;
@@ -27,7 +27,9 @@ use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 /// [`ProtocolVTable::from_raw_parts`] does that only if its destroy function holds a `cleanup`
 /// panic until the task is dropped; otherwise a panic in both aborts the process. Dropping the
 /// scheduler itself drops its live tasks as any value is dropped: a panic there goes to the code
-/// that drops the scheduler.
+/// that drops the scheduler. A task dropped while another panic unwinds (a scheduler dropped
+/// during a panic, say) aborts the process if its `cleanup` or its `Drop` panics, whatever its
+/// vtable, as any value whose drop panics during an unwind does.
 pub unsafe trait ProtocolTask: Send + Sync + 'static {
     /// Advance the task.
     ///
@@ -318,7 +320,9 @@ impl fmt::Debug for ProtocolVTable {
 
 /// An owned task behind its vtable; freed (after `cleanup`) when dropped. With a vtable from
 /// [`ProtocolVTable::of`] or [`derive_protocol_task_vtable!`](crate::derive_protocol_task_vtable),
-/// if `cleanup` panics, the task is still dropped and freed before the panic goes on.
+/// if `cleanup` panics, the task is still dropped and freed before the panic goes on. Dropped
+/// while another panic unwinds, it aborts the process if its `cleanup` or the task's drop panics,
+/// as any value whose drop panics during an unwind does.
 ///
 /// The fields are private, so the pointer and the vtable always belong to the same type; the one
 /// way to pair them by hand is the `unsafe` [`from_raw_parts`](Self::from_raw_parts). Safe code
@@ -355,14 +359,17 @@ impl ProtocolTaskPtr {
     /// Own `task` behind `vtable`.
     ///
     /// # Panics
-    /// If `vtable` was built for a type other than `T`. The task is dropped first.
+    /// If `vtable` was built for a type other than `T`. The task is dropped first, before the
+    /// panic, never while it unwinds: a panic in the task's drop is caught and named in the
+    /// panic's message.
     pub fn from_box<T: ProtocolTask>(task: Box<T>, vtable: &'static ProtocolVTable) -> Self {
-        assert!(
-            vtable.is_for::<T>(),
-            "protocol vtable is for {}, not {}",
-            vtable.type_name(),
-            std::any::type_name::<T>(),
-        );
+        if !vtable.is_for::<T>() {
+            let refused = format!("protocol vtable is for {}, not {}", vtable.type_name(), std::any::type_name::<T>());
+            match catch(move || drop(task)) {
+                Ok(()) => panic!("{refused}"),
+                Err(text) => panic!("{refused}; the task panicked as it was dropped: {text}"),
+            }
+        }
         Self {
             data: Box::into_raw(task) as *mut (),
             vtable,

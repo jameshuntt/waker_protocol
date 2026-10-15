@@ -125,13 +125,11 @@ impl<H> TaskEntry<H> {
     }
 
     /// Whether it has work a poll should act on: a message, a wake other than `QoS` or
-    /// `MemoryPressure` (those ask it to make room, and a checkpoint answers them), or, with
-    /// nothing waiting, a runnable state (it yielded).
-    fn has_work(&self) -> bool {
+    /// `MemoryPressure` (those ask it to make room, and a checkpoint answers them), or a `Yield`
+    /// it has not been polled for since (`yielded`), whatever wakes came after it.
+    fn has_work(&self, yielded: bool) -> bool {
         let asks_for_room = |reason: &WakeReason| matches!(reason, WakeReason::QoS | WakeReason::MemoryPressure);
-        !self.mailbox.is_empty()
-            || self.pending_wakes.iter().any(|reason| !asks_for_room(reason))
-            || (self.pending_wakes.is_empty() && matches!(self.state, TaskState::Runnable))
+        yielded || !self.mailbox.is_empty() || self.pending_wakes.iter().any(|reason| !asks_for_room(reason))
     }
 
     /// Whether the next round polls it (restoring it first if it is dormant).
@@ -272,7 +270,8 @@ impl Errors {
 enum Settle {
     /// Live in its row, waiting for a wake.
     Wait,
-    /// Live in its row and runnable, behind the tasks already waiting to run.
+    /// Live in its row and runnable, behind the tasks already waiting to run: it yielded, and is
+    /// owed a poll.
     RunAgain,
     /// Checkpointed and dormant, restored when woken.
     Checkpoint(CheckpointReason),
@@ -483,6 +482,9 @@ pub struct WakerProtocol<S: CheckpointStore> {
     strategy: Box<dyn CapitulateStrategy>,
     /// Tasks restored from a checkpoint and not polled since; the strategy is not asked about them.
     restored: HashSet<TaskId>,
+    /// Tasks that yielded and have not been polled since. Each is owed a poll, so a strategy
+    /// checkpoint keeps it runnable, even after a `QoS` or `MemoryPressure` wake.
+    yielded: HashSet<TaskId>,
     tx: Sender<SchedulerMsg>,
     rx: Receiver<SchedulerMsg>,
     seq: u64,
@@ -509,6 +511,7 @@ impl<S: CheckpointStore> WakerProtocol<S> {
             shutdown: false,
             strategy,
             restored: HashSet::new(),
+            yielded: HashSet::new(),
             tx,
             rx,
             seq: 1,
@@ -829,11 +832,12 @@ impl<S: CheckpointStore> WakerProtocol<S> {
     fn poll_one(&mut self, id: TaskId, errors: &mut Errors) {
         // A task restored for this round is polled before the strategy is asked about it again.
         let restored = self.restored.contains(&id);
+        let yielded = self.yielded.contains(&id);
         let Some(entry) = self.tasks.get_mut(id) else { return };
         // The strategy sees the task as it was before this round's messages and wakes.
         let snapshot = if restored { None } else { Self::snapshot(id, entry) };
         let last_wake = entry.pending_wakes.back().or(entry.stats.last_wake.as_ref()).cloned();
-        let had_work = entry.has_work();
+        let had_work = entry.has_work(yielded);
         let Some(live) = entry.take_live() else { return };
         let mut out = OutOfRow::hold(&mut entry.resident, live);
 
@@ -858,6 +862,7 @@ impl<S: CheckpointStore> WakerProtocol<S> {
             }
 
             self.restored.remove(&id);
+            self.yielded.remove(&id);
             entry.stats.poll_count += 1;
             entry.stats.last_polled_at = Some(Instant::now());
             let task = out.task();
@@ -892,6 +897,7 @@ impl<S: CheckpointStore> WakerProtocol<S> {
             Settle::Wait => self.put_back(id, live, TaskState::Waiting, None),
             Settle::RunAgain => {
                 let seq = self.bump_seq();
+                self.yielded.insert(id);
                 self.put_back(id, live, TaskState::Runnable, Some(seq))
             }
             Settle::Checkpoint(reason) => self.checkpoint_live(id, live, reason, false),
@@ -993,6 +999,7 @@ impl<S: CheckpointStore> WakerProtocol<S> {
             return errors.finish();
         };
         self.restored.remove(&id);
+        self.yielded.remove(&id);
         let TaskEntry { resident, mailbox, mut checkpoint_history, policy, .. } = entry;
         let retention = &policy.retention;
         let retain = match &state {

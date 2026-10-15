@@ -2172,3 +2172,73 @@ fn a_message_whose_drop_panics_sent_to_a_task_already_ended_is_an_error_for_the_
         sched.run_once().unwrap();
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// 0.3.2, fifth review: `from_box` drops a task it refuses before it panics; the drop of a refused
+// message is caught; a `Yield` keeps its poll when a `QoS` or `MemoryPressure` wake follows it.
+
+#[test]
+fn from_box_drops_a_task_it_refuses_before_it_panics() {
+    let refused = "protocol vtable is for scheduler::Counter, not scheduler::Fragile";
+    for (panic_in, expected) in [(0, refused.to_owned()), (IN_DROP, format!("{refused}; the task panicked as it was dropped: boom in drop"))] {
+        let before = drops();
+        clear_order();
+        // With IN_DROP the task's drop panics, which while from_box's own panic unwound would
+        // abort the process.
+        let caught = catch_unwind(|| ProtocolTaskPtr::from_box(Fragile::boxed(PENDING, panic_in), &COUNTER_VTABLE));
+        let payload = caught.expect_err("from_box refuses a vtable for another type");
+        assert_eq!(payload.downcast_ref::<String>(), Some(&expected), "panic_in {panic_in}");
+        assert_eq!(order(), ["drop"], "panic_in {panic_in}: the task is dropped once");
+        assert_eq!(drops() - before, 1, "panic_in {panic_in}");
+    }
+}
+
+#[test]
+fn a_refused_message_whose_drop_panics_is_an_error_and_the_task_goes_on() {
+    let mut sched = scheduler();
+    let before = drops();
+    let h = sched.spawn_box(COUNTER, Counter::boxed("c", 100), TaskPolicy::default()).unwrap();
+    let background = TaskPolicy { qos: QoSClass::Background, ..TaskPolicy::default() };
+    let after = sched.spawn_box(COUNTER, Counter::boxed("after", 100), background).unwrap();
+    sched.run_once().unwrap();
+    clear_order();
+
+    // Written for `Other` and sent to a Counter: refused, then dropped, and its drop panics.
+    let wrong = typed_envelope::<Other, Grenade>("wrong", Grenade, |_, _| Ok(()));
+    sched.sender().send(SchedulerMsg::Deliver { id: h.id(), envelope: wrong }).unwrap();
+    after.wake(WakeReason::Manual).unwrap();
+    let round = catch_unwind(AssertUnwindSafe(|| sched.run_once()));
+
+    let expected = [
+        format!("envelope \"wrong\" for task {:?} targets another task type than scheduler::Counter", h.id()),
+        format!("message \"wrong\" for task {:?} panicked as it was dropped: boom in a message's drop", h.id()),
+    ]
+    .join("; ");
+    assert!(matches!(&round, Ok(Err(err)) if *err == expected), "{round:?}");
+    assert_eq!(order(), ["message drop", "c", "after"], "the message is dropped, then both tasks are polled");
+    assert!(is_live(&sched, h.id()), "the task stays live in its row");
+    assert_eq!(row(&sched, h.id()).stats.poll_count, 2, "and is polled");
+    assert_eq!(row(&sched, after.id()).stats.poll_count, 2, "the task after it is polled in that round");
+    assert_eq!(drops() - before, 0, "nothing is freed");
+}
+
+#[test]
+fn an_over_budget_task_keeps_the_poll_for_its_yield_when_a_qos_or_memory_pressure_wake_follows() {
+    for reason in [WakeReason::QoS, WakeReason::MemoryPressure] {
+        let mut sched = scheduler();
+        let h = sched.spawn_box(SCRIPTED, Scripted::boxed(64, &[YIELD, YIELD, READY]), over_budget()).unwrap();
+        sched.run_once().unwrap(); // checkpointed in place of its first poll
+        sched.run_once().unwrap(); // restored and polled: it yields
+        h.wake(reason.clone()).unwrap();
+        sched.run_once().unwrap(); // checkpointed in place of the poll for the Yield, and the wake answered
+        let entry = row(&sched, h.id());
+        assert!(matches!(entry.resident, Resident::Dormant), "{reason:?}: the strategy checkpointed it");
+        assert_eq!(entry.state, TaskState::Runnable, "{reason:?}: runnable for the Yield");
+        assert_eq!(entry.stats.last_wake, Some(reason.clone()), "{reason:?}: on_wake heard the wake");
+        for _ in 0..20 {
+            sched.run_once().unwrap();
+        }
+        assert!(sched.tasks.get(h.id()).is_none(), "{reason:?}: every Yield got its poll");
+        assert_eq!(sched.finished, [(h.id(), TaskState::Completed)], "{reason:?}");
+    }
+}

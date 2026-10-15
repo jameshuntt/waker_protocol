@@ -143,8 +143,8 @@ fn this_files_header_names_the_draft_as_well() {
 fn the_budget_docs_say_a_qos_or_memory_pressure_wake_gets_no_poll() {
     says(POLICY, "checkpointed in place of a poll, and the next round restores and polls it;", "if it had work waiting, the next round restores and");
     says(POLICY, "one poll for every wake,", "poll for every message, every wake other than `QoS` or `MemoryPressure`, and every `Yield`,");
-    says(POLICY, "one poll for every wake,", "`on_wake` and is answered by the checkpoint, with no poll");
-    says(README, "wake, every message and every `Yield`", "message, every wake other than `QoS` or `MemoryPressure`, and every `Yield`, a round later");
+    says(POLICY, "one poll for every wake,", "`on_wake` and is\n    /// answered by the checkpoint, with no poll");
+    says(README, "wake, every message and every `Yield`", "every message, every wake other than `QoS` or\n  `MemoryPressure`, and every `Yield`, a round later");
 }
 
 /// Proved by `a_panic_in_a_messages_deliver_drops_only_that_message_and_the_round_goes_on` and
@@ -199,8 +199,10 @@ fn the_readme_lists_what_came_back_from_0_2_0_and_the_debug_output() {
 }
 
 /// Proved by `a_panic_in_a_messages_kind_or_target_type_loses_only_that_message_and_never_aborts`,
-/// `a_panic_in_kind_at_a_tasks_end_still_frees_everything_and_removes_its_checkpoints` and
-/// `a_message_whose_drop_panics_sent_to_a_task_already_ended_is_an_error_for_the_round`.
+/// `a_panic_in_kind_at_a_tasks_end_still_frees_everything_and_removes_its_checkpoints`,
+/// `a_message_whose_drop_panics_sent_to_a_task_already_ended_is_an_error_for_the_round` and
+/// `a_refused_message_whose_drop_panics_is_an_error_and_the_task_goes_on`; what 0.3.1 did with a
+/// refused message whose drop panics, by that last test's case run against 0.3.1's code.
 #[test]
 fn the_docs_say_a_panic_in_kind_or_target_type_or_in_a_message_for_an_ended_task_is_caught() {
     says(
@@ -220,6 +222,7 @@ fn the_docs_say_a_panic_in_kind_or_target_type_or_in_a_message_for_an_ended_task
         "So is a panic in the drop of a message still queued for a task\n  that ends.",
         "So is a panic in the drop of a message that is not delivered:\n  one still queued for a task that ends, one sent to a task that has already ended, or one\n  refused.",
     );
+    tells(README, "a panic in the drop of a refused message reached the caller and left the task's row as\n  `Resident::Empty` for good;");
 }
 
 /// Proved by `the_raw_waker_vtable_static_is_a_copy_the_crates_wakers_do_not_carry`.
@@ -250,9 +253,9 @@ fn the_double_panic_claim_names_the_vtables_it_holds_for() {
     says(
         README,
         "so a panic in the drop as well no longer aborts the process; that holds\n  wherever a `ProtocolTaskPtr` is dropped.",
-        "that holds wherever a\n  `ProtocolTaskPtr` with such a vtable is dropped.",
+        "that holds wherever a\n  `ProtocolTaskPtr` with such a vtable is dropped outside an unwind.",
     );
-    tells(README, "still aborts when\n  both panic.");
+    tells(README, "still aborts when both panic.");
 }
 
 /// The 0.3.0 notes named the private fields, and `type_name()` was public in 0.3.0 (its
@@ -295,5 +298,72 @@ fn the_docs_say_the_task_pointer_can_be_read_through_a_shared_reference() {
 #[test]
 fn the_readme_says_the_derive_calls_the_trait_functions() {
     tells(README, "**`derive_protocol_task_vtable!` calls the `ProtocolTask` functions.**");
-    tells(README, "so an inherent method of the same name, when the type had one, ran in\n  place of the trait's.");
+    tells(README, "Such a method no longer\n  runs from the scheduler, with no error");
+}
+
+// The fifth review of the 0.3.2 draft.
+
+/// Proved by `an_over_budget_task_keeps_the_poll_for_its_yield_when_a_qos_or_memory_pressure_wake_follows`,
+/// `an_over_budget_task_that_yields_runs_to_the_end_without_a_wake` and, for a task without
+/// `eager_repoll_after_yield`, `yield_runs_again_next_round_when_eager_and_waits_for_a_wake_when_not`.
+#[test]
+fn the_strategy_docs_say_a_yield_keeps_its_poll_whatever_wakes_come_after_it() {
+    let old = "or a `Yield` and no wake since";
+    says(CAPITULATE, old, "or a `Yield` it has not been polled for, whatever wakes came after it; a\n/// `Yield` counts only with `eager_repoll_after_yield`");
+    says(README, old, "or a `Yield` it has not been polled for, whatever wakes came after it),");
+    tells(README, "A `Yield`\n  counts only with `eager_repoll_after_yield` (the default)");
+    says(SCHEDULER, "with\n    /// nothing waiting, a runnable state (it yielded)", "or a `Yield`\n    /// it has not been polled for since (`yielded`), whatever wakes came after it.");
+    tells(POLICY, "A `Yield` keeps its poll even when a `QoS` or\n    /// `MemoryPressure` wake comes after it, and counts only with `eager_repoll_after_yield`.");
+}
+
+/// A probe that drops a `ProtocolTaskPtr` of `derive_protocol_task_vtable!` whose `cleanup` and
+/// `Drop` both panic: dropped on its own, the panic is caught; dropped while another panic
+/// unwinds, the process aborts.
+#[test]
+fn the_double_panic_claim_says_a_drop_during_an_unwind_still_aborts() {
+    says(
+        README,
+        "that holds wherever a\n  `ProtocolTaskPtr` with such a vtable is dropped. ",
+        "A `ProtocolTaskPtr` dropped while another panic\n  unwinds (by a scheduler dropped during a panic, say) aborts the process if its `cleanup` or its\n  drop panics, whatever its vtable",
+    );
+    tells(TASK, "A task dropped while another panic unwinds (a scheduler dropped\n/// during a panic, say) aborts the process if its `cleanup` or its `Drop` panics");
+    tells(TASK, "Dropped\n/// while another panic unwinds, it aborts the process if its `cleanup` or the task's drop panics");
+}
+
+/// Proved by `debug_output_shows_the_full_type_path` (a vtable from `from_raw_parts` included)
+/// and `spawn_refuses_a_key_for_another_type`; the check is `ProtocolVTable::is_for`, which
+/// compares `TypeId`.
+#[test]
+fn the_debug_note_says_the_check_compares_type_id_and_a_hand_written_vtable_had_its_own_name() {
+    says(
+        README,
+        "it\n  is the same value the vtable's type check uses.",
+        "The type check itself compares\n  `TypeId`; the name is what its error messages print.",
+    );
+    tells(README, "A vtable written by hand in 0.2.0\n  carried whatever name its `type_name` field was given; `ProtocolVTable::from_raw_parts::<T>`\n  records `std::any::type_name::<T>()` and takes no name.");
+}
+
+/// 0.2.0's expansion is `(&mut *(ptr as *mut $t)).poll()`, `(&*(ptr as *const $t)).footprint_estimate()`
+/// and `Box::from_raw(ptr as *mut $t).cleanup()`; a probe of those calls on types with inherent
+/// methods of each receiver ran the inherent `poll` and `footprint_estimate` only with the trait's
+/// receiver, and the inherent `cleanup` with `self`, `&self` and `&mut self`.
+#[test]
+fn the_derive_note_says_which_inherent_methods_ran_in_0_2_0() {
+    says(
+        README,
+        "so an inherent method of the same name, when the type had one, ran in\n  place of the trait's.",
+        "for `poll`, `on_wake`, `checkpoint` and `footprint_estimate`, one with\n  the same receiver as the trait's (`&mut self`, or `&self` for `footprint_estimate`); for\n  `cleanup`, which it called on the task's `Box`, one with any receiver.",
+    );
+}
+
+/// Proved by `from_box_drops_a_task_it_refuses_before_it_panics`.
+#[test]
+fn the_docs_say_from_box_drops_a_task_it_refuses_before_it_panics() {
+    says(
+        TASK,
+        "If `vtable` was built for a type other than `T`. The task is dropped first.\n",
+        "The task is dropped first, before the\n    /// panic, never while it unwinds: a panic in the task's drop is caught and named in the\n    /// panic's message.",
+    );
+    tells(README, "**`ProtocolTaskPtr::from_box` drops a task it refuses before it panics.**");
+    tells(README, "In 0.3.0 and 0.3.1 it panicked first and dropped the task while that panic\n  unwound, so a task whose drop panicked aborted the process.");
 }

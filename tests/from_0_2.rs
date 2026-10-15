@@ -234,6 +234,8 @@ fn into_raw_parts_gives_the_task_up_and_from_raw_parts_takes_it_back() {
 #[test]
 fn debug_output_shows_the_full_type_path() {
     assert_eq!(format!("{JOB_VTABLE:?}"), "ProtocolVTable { type_name: \"from_0_2::Job\", .. }");
+    let hand = format!("{HAND_VTABLE:?}");
+    assert_eq!(hand, "ProtocolVTable { type_name: \"from_0_2::Job\", .. }", "from_raw_parts records the type's name");
     let task = ProtocolTaskPtr::from_box(Job::boxed(), &JOB_VTABLE);
     let shown = format!("{task:?}");
     assert!(shown.starts_with("ProtocolTaskPtr { data: "), "{shown}");

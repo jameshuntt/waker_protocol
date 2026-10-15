@@ -7,6 +7,7 @@ use crate::task::{ProtocolTask, ProtocolTaskPtr, ProtocolVTable};
 use crate::types::{CheckpointReason, SchedulerMsg, TaskId, TaskPoll, TaskState, TaskStats, WakeReason};
 use crate::{CapitulatePlan, TaskPolicy};
 use crossbeam_channel::{unbounded, Receiver, Sender};
+use std::any::Any;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::marker::PhantomData;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -48,9 +49,11 @@ pub enum Resident {
     /// Checkpointed out; restored when woken (by policy).
     Dormant,
     /// Out of its row while the scheduler works on it. No row is left this way when `run_once` or
-    /// `pump` returns. A panic in the task's own `poll`, `on_wake` or `checkpoint` ends the task as
-    /// Failed; a panic from the checkpoint store or the capitulation strategy reaches the caller
-    /// with the task put back in its row, live.
+    /// `pump` returns. A panic in the task's own `poll`, `on_wake`, `checkpoint`, `restore` or
+    /// `footprint_estimate` ends the task as Failed; a panic from the store's `save` or from the
+    /// capitulation strategy reaches the caller with the task put back in its row, live. The
+    /// store's `load` and `remove` are never called while the task is out of its row (see
+    /// [`run_once`](WakerProtocol::run_once)).
     Empty,
 }
 
@@ -122,6 +125,16 @@ impl<H> TaskEntry<H> {
         }
     }
 
+    /// Whether it has work a poll should act on: a message, a wake other than `QoS` or
+    /// `MemoryPressure` (those ask it to make room, and a checkpoint answers them), or, with
+    /// nothing waiting, a runnable state (it yielded).
+    fn has_work(&self) -> bool {
+        let asks_for_room = |reason: &WakeReason| matches!(reason, WakeReason::QoS | WakeReason::MemoryPressure);
+        !self.mailbox.is_empty()
+            || self.pending_wakes.iter().any(|reason| !asks_for_room(reason))
+            || (self.pending_wakes.is_empty() && matches!(self.state, TaskState::Runnable))
+    }
+
     /// Whether the next round polls it (restoring it first if it is dormant).
     fn is_runnable(&self) -> bool {
         !self.stays_dormant()
@@ -146,10 +159,10 @@ impl<H> TaskEntry<H> {
     }
 }
 
-/// A live task out of its row while the scheduler calls the task, the store or the strategy. If
-/// the guard is dropped still holding the task, it puts the task back in its row, live: a panic
-/// from the store or the strategy reaches the caller with the scheduler consistent, and a save
-/// that fails leaves the task as it was.
+/// A live task out of its row while the scheduler calls the task, the store's `save` or the
+/// strategy. If the guard is dropped still holding the task, it puts the task back in its row,
+/// live: a panic from `save` or the strategy reaches the caller with the scheduler consistent, and
+/// a save that fails leaves the task as it was.
 struct OutOfRow<'a> {
     row: &'a mut Resident,
     task: Option<ProtocolTaskPtr>,
@@ -180,16 +193,31 @@ impl Drop for OutOfRow<'_> {
 }
 
 /// Run `call`, the task's own function `name`. A panic in it is caught and becomes the message
-/// the task fails with.
+/// the task fails with. No panic leaves this function, not even one from dropping the payload.
 fn caught<R>(name: &str, call: impl FnOnce() -> R) -> Result<R, String> {
-    catch_unwind(AssertUnwindSafe(call)).map_err(|panic| {
-        let text = panic
+    catch_unwind(AssertUnwindSafe(call)).map_err(|payload| {
+        let text = payload
             .downcast_ref::<&str>()
             .copied()
-            .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
             .unwrap_or("a panic payload that is not text");
-        format!("task panicked in {name}: {text}")
+        let message = format!("task panicked in {name}: {text}");
+        drop_payload(payload);
+        message
     })
+}
+
+/// Drop a caught panic's payload without letting a panic out. If the payload's own drop panics,
+/// that panic is caught too and its payload dropped the same way; after three such panics in a
+/// row the last payload is leaked instead, so a payload that always panics cannot loop forever.
+fn drop_payload(mut payload: Box<dyn Any + Send>) {
+    for _ in 0..3 {
+        match catch_unwind(AssertUnwindSafe(move || drop(payload))) {
+            Ok(()) => return,
+            Err(again) => payload = again,
+        }
+    }
+    std::mem::forget(payload);
 }
 
 /// Every error met while a round runs. A round never stops at an error: it finishes, then
@@ -222,6 +250,9 @@ enum Settle {
     RunAgain,
     /// Checkpointed and dormant, restored when woken.
     Checkpoint(CheckpointReason),
+    /// Checkpointed in place of a poll the task had work for: dormant but runnable, so the next
+    /// round restores and polls it.
+    CheckpointAndRunAgain(CheckpointReason),
     /// Ended in this state and removed; its checkpoints follow the retention policy.
     Finish(TaskState),
 }
@@ -233,6 +264,15 @@ impl Settle {
             Self::Checkpoint(plan.reason)
         } else {
             Self::Finish(TaskState::Completed)
+        }
+    }
+
+    /// A strategy's plan, carried out in place of a poll. A task it checkpoints that had work
+    /// waiting stays runnable, so the plan puts the poll off to the next round but never drops it.
+    fn in_place_of_poll(plan: CapitulatePlan, had_work: bool) -> Self {
+        match Self::capitulate(plan) {
+            Self::Checkpoint(reason) if had_work => Self::CheckpointAndRunAgain(reason),
+            settle => settle,
         }
     }
 
@@ -403,8 +443,8 @@ pub struct WakerProtocol<S: CheckpointStore> {
     pub reclaim_log: Vec<ReclaimReport<S::Handle>>,
     /// Every task the scheduler has removed, oldest first, with the state it ended in:
     /// `Completed`, `Cancelled`, or `Failed` with its message. A task that panicked in its own
-    /// `poll`, `on_wake` or `checkpoint` is here as `Failed`, its message naming the panic. Like
-    /// `reclaim_log` it only grows; clear it once read.
+    /// `poll`, `on_wake`, `checkpoint`, `restore` or `footprint_estimate` is here as `Failed`, its
+    /// message naming the panic. Like `reclaim_log` it only grows; clear it once read.
     pub finished: Vec<(TaskId, TaskState)>,
     /// Settings.
     pub config: SchedulerConfig,
@@ -512,14 +552,20 @@ impl<S: CheckpointStore> WakerProtocol<S> {
     ///
     /// An error does not stop the round. A message refused for being written for another task
     /// type, or one whose `deliver` returns `Err`, is dropped and its task goes on; a checkpoint
-    /// that cannot be saved leaves its task live in its row as it was; a task that cannot be
-    /// restored stays dormant. Once the round is done, every error it met is returned, joined
-    /// with `"; "`.
+    /// that cannot be saved leaves its task live in its row as it was; a task whose checkpoint
+    /// cannot be loaded stays dormant. Once the round is done, every error it met is returned,
+    /// joined with `"; "`.
     ///
-    /// A panic in a task's own `poll`, `on_wake` or `checkpoint` is caught: the task ends as
-    /// `TaskState::Failed`, with a message naming the panic, and is removed like any failed task
-    /// (see [`finished`](Self::finished)). A panic from the checkpoint store or the capitulation
-    /// strategy reaches the caller, with the task put back in its row, live.
+    /// A panic in a task's own `poll`, `on_wake`, `checkpoint`, `restore` or `footprint_estimate`
+    /// is caught: the task ends as `TaskState::Failed`, with a message naming the panic, and is
+    /// removed like any failed task (see [`finished`](Self::finished)); the round goes on. A panic
+    /// from the store's `save` or from the capitulation strategy reaches the caller, with the task
+    /// put back in its row, live.
+    ///
+    /// A panic from the store's `load` also reaches the caller, and the task stays dormant. A
+    /// panic from its `remove` reaches the caller after the task is already dormant (a checkpoint)
+    /// or already removed and freed (the task's end); the checkpoints it had not yet removed stay
+    /// in the store, and in a dormant task's history, where a later prune tries them again.
     ///
     /// After a Shutdown message has been handled this does nothing: later messages stay in the
     /// channel, and no task is restored or polled.
@@ -695,7 +741,12 @@ impl<S: CheckpointStore> WakerProtocol<S> {
 
         let handle = latest_handle.ok_or_else(|| format!("dormant task {:?} missing checkpoint", id))?;
         let bytes = self.store.load(&handle)?;
-        let restored = ProtocolTaskPtr::restore_from_bytes(vtable, &bytes);
+        let restored = match caught("restore", || ProtocolTaskPtr::restore_from_bytes(vtable, &bytes)) {
+            Ok(restored) => restored,
+            // These bytes will never restore: the task ends as Failed, and retain_on_failure
+            // decides whether they stay in the store.
+            Err(panic) => return self.finish(id, TaskState::Failed(panic)),
+        };
 
         if let Some(entry) = self.tasks.get_mut(id) {
             entry.resident = Resident::Live(restored);
@@ -709,28 +760,28 @@ impl<S: CheckpointStore> WakerProtocol<S> {
     }
 
     /// What the capitulation strategy sees of task `id`, read with the task in its row; `None`
-    /// unless the task is live.
-    fn snapshot(id: TaskId, entry: &TaskEntry<S::Handle>) -> Option<TaskSnapshot> {
+    /// unless the task is live, and `Err` naming the panic if its `footprint_estimate` panics.
+    fn snapshot(id: TaskId, entry: &TaskEntry<S::Handle>) -> Option<Result<TaskSnapshot, String>> {
         let Resident::Live(live) = &entry.resident else { return None };
         let now = Instant::now();
 
-        Some(TaskSnapshot {
+        Some(caught("footprint_estimate", || live.footprint_estimate()).map(|footprint_bytes| TaskSnapshot {
             id,
             qos: entry.policy.qos,
             state: entry.state.clone(),
-            footprint_bytes: live.footprint_estimate(),
+            footprint_bytes,
             mailbox_len: entry.mailbox.len(),
             pending_wakes: entry.pending_wakes.len(),
             poll_count: entry.stats.poll_count,
             idle_for: entry.stats.last_polled_at.map(|t| now.saturating_duration_since(t)),
             memory_budget_hint: entry.policy.memory_budget_hint,
-        })
+        }))
     }
 
     /// Deliver task `id`'s messages and wakes, ask the strategy, then poll it. Every error is
     /// noted in `errors`, and the task always ends settled: live, dormant or removed. A panic in
-    /// the task's `on_wake` or `poll` ends it as Failed; a panic from the strategy reaches the
-    /// caller with the task back in its row, live.
+    /// the task's `footprint_estimate`, `on_wake` or `poll` ends it as Failed; a panic from the
+    /// strategy reaches the caller with the task back in its row, live.
     fn poll_one(&mut self, id: TaskId, errors: &mut Errors) {
         // A task restored for this round is polled before the strategy is asked about it again.
         let restored = self.restored.contains(&id);
@@ -738,40 +789,38 @@ impl<S: CheckpointStore> WakerProtocol<S> {
         // The strategy sees the task as it was before this round's messages and wakes.
         let snapshot = if restored { None } else { Self::snapshot(id, entry) };
         let last_wake = entry.pending_wakes.back().or(entry.stats.last_wake.as_ref()).cloned();
+        let had_work = entry.has_work();
         let Some(live) = entry.take_live() else { return };
         let mut out = OutOfRow::hold(&mut entry.resident, live);
 
-        while let Some(envelope) = entry.mailbox.pop_front() {
-            errors.note(Self::deliver(id, out.task(), envelope));
-        }
-        let mut woken = Ok(());
-        while let Some(reason) = entry.pending_wakes.pop_front() {
-            entry.stats.last_wake = Some(reason.clone());
-            let task = out.task();
-            // SAFETY: the task is out of its row, so this call has exclusive access to a live task (ProtocolTask's contract).
-            woken = caught("on_wake", || unsafe { task.on_wake(reason) });
-            if woken.is_err() {
-                break;
+        let settle = 'settle: {
+            let snapshot = match snapshot.transpose() {
+                Ok(snapshot) => snapshot,
+                Err(panic) => break 'settle Settle::Finish(TaskState::Failed(panic)),
+            };
+            while let Some(envelope) = entry.mailbox.pop_front() {
+                errors.note(Self::deliver(id, out.task(), envelope));
             }
-        }
-
-        let plan = match (&woken, snapshot) {
-            (Ok(()), Some(snapshot)) => self.strategy.plan(&snapshot, last_wake.as_ref()),
-            _ => None,
-        };
-        let settle = match (woken, plan) {
-            (Err(panic), _) => Settle::Finish(TaskState::Failed(panic)),
-            (Ok(()), Some(plan)) => Settle::capitulate(plan),
-            (Ok(()), None) => {
-                self.restored.remove(&id);
-                entry.stats.poll_count += 1;
-                entry.stats.last_polled_at = Some(Instant::now());
+            while let Some(reason) = entry.pending_wakes.pop_front() {
+                entry.stats.last_wake = Some(reason.clone());
                 let task = out.task();
                 // SAFETY: the task is out of its row, so this call has exclusive access to a live task (ProtocolTask's contract).
-                match caught("poll", || unsafe { task.poll() }) {
-                    Ok(poll) => Settle::after_poll(poll, &entry.policy),
-                    Err(panic) => Settle::Finish(TaskState::Failed(panic)),
+                if let Err(panic) = caught("on_wake", || unsafe { task.on_wake(reason) }) {
+                    break 'settle Settle::Finish(TaskState::Failed(panic));
                 }
+            }
+            if let Some(plan) = snapshot.and_then(|snapshot| self.strategy.plan(&snapshot, last_wake.as_ref())) {
+                break 'settle Settle::in_place_of_poll(plan, had_work);
+            }
+
+            self.restored.remove(&id);
+            entry.stats.poll_count += 1;
+            entry.stats.last_polled_at = Some(Instant::now());
+            let task = out.task();
+            // SAFETY: the task is out of its row, so this call has exclusive access to a live task (ProtocolTask's contract).
+            match caught("poll", || unsafe { task.poll() }) {
+                Ok(poll) => Settle::after_poll(poll, &entry.policy),
+                Err(panic) => Settle::Finish(TaskState::Failed(panic)),
             }
         };
         let live = out.release();
@@ -807,7 +856,7 @@ impl<S: CheckpointStore> WakerProtocol<S> {
             // Dormant: its checkpoint is already in the store, so only Finish changes anything.
             return match settle {
                 Settle::Finish(state) => self.finish(id, state),
-                Settle::Wait | Settle::RunAgain | Settle::Checkpoint(_) => Ok(()),
+                Settle::Wait | Settle::RunAgain | Settle::Checkpoint(_) | Settle::CheckpointAndRunAgain(_) => Ok(()),
             };
         };
 
@@ -820,7 +869,8 @@ impl<S: CheckpointStore> WakerProtocol<S> {
                     entry.runnable_seq = seq;
                 }
             }
-            Settle::Checkpoint(reason) => return self.checkpoint_live(id, live, reason),
+            Settle::Checkpoint(reason) => return self.checkpoint_live(id, live, reason, false),
+            Settle::CheckpointAndRunAgain(reason) => return self.checkpoint_live(id, live, reason, true),
             Settle::Finish(state) => {
                 let finished = self.finish(id, state);
                 drop(live); // runs the task's cleanup and frees it, once its row is gone
@@ -837,18 +887,30 @@ impl<S: CheckpointStore> WakerProtocol<S> {
         }
     }
 
-    /// Checkpoint `live`, task `id`, and leave the task dormant. The task is freed only once its
-    /// bytes are saved: if the save fails, or the store panics, it goes back into its row, live and
-    /// as it was, and the error (or the panic) goes to the caller. If the task's own `checkpoint`
-    /// panics, the task ends as Failed.
-    fn checkpoint_live(&mut self, id: TaskId, live: ProtocolTaskPtr, reason: CheckpointReason) -> Result<(), String> {
+    /// Checkpoint `live`, task `id`, and leave the task dormant; with `run_again` its state stays
+    /// `Runnable`, so the next round restores and polls it. The task is freed only once its bytes
+    /// are saved: if the save fails, or panics, it goes back into its row, live and as it was, and
+    /// the error (or the panic) goes to the caller. If the task's own `footprint_estimate` or
+    /// `checkpoint` panics, the task ends as Failed. A panic from the store's `remove`, while older
+    /// checkpoints are pruned, comes once the task is dormant.
+    fn checkpoint_live(
+        &mut self,
+        id: TaskId,
+        live: ProtocolTaskPtr,
+        reason: CheckpointReason,
+        run_again: bool,
+    ) -> Result<(), String> {
+        // Kept runnable, it waits behind the tasks already waiting to run, as after a Yield.
+        let run_again = run_again.then(|| self.bump_seq());
         let Some(entry) = self.tasks.get_mut(id) else { return Ok(()) };
         let mut out = OutOfRow::hold(&mut entry.resident, live);
-        let before_bytes = out.task().footprint_estimate();
         let task = out.task();
-        // SAFETY: the task is out of its row, so this call has exclusive access to a live task (ProtocolTask's contract).
-        let payload = match caught("checkpoint", || unsafe { task.checkpoint() }) {
-            Ok(payload) => payload,
+        let checkpointed = caught("footprint_estimate", || task.footprint_estimate()).and_then(|before_bytes| {
+            // SAFETY: the task is out of its row, so this call has exclusive access to a live task (ProtocolTask's contract).
+            caught("checkpoint", || unsafe { task.checkpoint() }).map(|payload| (before_bytes, payload))
+        });
+        let (before_bytes, payload) = match checkpointed {
+            Ok(checkpointed) => checkpointed,
             Err(panic) => {
                 let live = out.release();
                 return self.settle(id, Some(live), Settle::Finish(TaskState::Failed(panic)));
@@ -860,8 +922,14 @@ impl<S: CheckpointStore> WakerProtocol<S> {
 
         entry.checkpoint_history.push_back(handle.clone());
         entry.stats.checkpoint_count += 1;
-        entry.state = TaskState::Dormant;
         entry.resident = Resident::Dormant;
+        match run_again {
+            Some(seq) => {
+                entry.state = TaskState::Runnable;
+                entry.runnable_seq = seq;
+            }
+            None => entry.state = TaskState::Dormant,
+        }
 
         let after_bytes = std::mem::size_of::<TaskId>();
         self.reclaim_log.push(ReclaimReport {

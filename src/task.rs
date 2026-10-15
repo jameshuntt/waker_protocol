@@ -11,8 +11,9 @@ use std::fmt;
 /// which may not be bytes this type wrote; it must not cause undefined behavior for any input
 /// (panicking is fine).
 ///
-/// If `poll`, `on_wake` or `checkpoint` panics, the scheduler catches it and the task ends as
-/// [`TaskState::Failed`](crate::TaskState::Failed), with a message naming the panic.
+/// If `poll`, `on_wake`, `checkpoint`, `restore` or `footprint_estimate` panics, the scheduler
+/// catches it and the task ends as [`TaskState::Failed`](crate::TaskState::Failed), with a
+/// message naming the panic. That holds for any panic payload, even one whose own drop panics.
 pub unsafe trait ProtocolTask: Send + Sync + 'static {
     /// Advance the task.
     ///

@@ -1,12 +1,13 @@
-//! The docs say what the code does. Each test below checks a sentence a review of 0.3.0 found
-//! false: the old wording is gone and the new wording is there. The test named in each comment,
-//! in tests/scheduler.rs or src/slab.rs, proves the new wording against the code.
+//! The docs say what the code does. Each test below checks a sentence a review of 0.3.0 or 0.3.1
+//! found false: the old wording is gone and the new wording is there. The test named in each
+//! comment, in tests/scheduler.rs or src/slab.rs, proves the new wording against the code.
 
 const SCHEDULER: &str = include_str!("../src/scheduler.rs");
 const POLICY: &str = include_str!("../src/policy.rs");
 const TYPES: &str = include_str!("../src/types.rs");
 const SLAB: &str = include_str!("../src/slab.rs");
 const CAPITULATE: &str = include_str!("../src/capitulate.rs");
+const TASK: &str = include_str!("../src/task.rs");
 const README: &str = include_str!("../readme.md");
 
 fn says(doc: &str, old: &str, new: &str) {
@@ -81,4 +82,36 @@ fn readme_does_not_claim_heav_task_asserts_anything() {
         "its code is commented out, so it runs nothing and asserts nothing.",
     );
     says(README, "# a stateful chaos task", "# 1000 tasks under wake churn: each finishes and is freed once");
+}
+
+/// Proved by `a_panic_whose_payload_panics_when_dropped_still_ends_the_task_as_failed`,
+/// `a_panic_in_restore_ends_the_task_as_failed_and_the_round_goes_on` and the two
+/// `a_panic_in_footprint_estimate_...` tests.
+#[test]
+fn every_task_function_the_scheduler_catches_is_named() {
+    let old = "`poll`, `on_wake` or `checkpoint`";
+    says(TASK, old, "If `poll`, `on_wake`, `checkpoint`, `restore` or `footprint_estimate` panics, the");
+    says(TASK, old, "even one whose own drop panics");
+    says(SCHEDULER, old, "`poll`, `on_wake`, `checkpoint`, `restore` or `footprint_estimate`");
+    says(TYPES, "`on_wake`\n    /// or `checkpoint`.", "`poll`, `on_wake`, `checkpoint`, `restore` or `footprint_estimate`.");
+}
+
+/// Proved by `a_panic_from_the_stores_load_or_remove_reaches_the_caller_and_leaves_the_task_as_the_docs_say`
+/// and `a_panic_from_the_store_reaches_the_caller_with_the_task_live_in_its_row`.
+#[test]
+fn only_a_panic_in_the_stores_save_is_said_to_put_the_task_back_live() {
+    says(SCHEDULER, "a panic from the checkpoint store or the capitulation strategy", "from the store's `save` or from the capitulation strategy reaches the caller");
+    says(SCHEDULER, "or the store panics, it goes back", "A panic from the store's `load` also reaches the caller, and the task stays dormant.");
+    says(SCHEDULER, "from the store or the strategy reaches the caller", "already removed and freed (the task's end)");
+    says(README, "In 0.3.1 each of these panics freed the task", "or in the store's `save` freed the task");
+    says(README, "A panic from the checkpoint store or the capitulation strategy still", "`load` also reaches the caller, and the task stays dormant.");
+}
+
+/// Proved by `the_strategy_is_never_shown_a_task_just_restored`, `every_message_to_an_over_budget_task_gets_a_poll`
+/// and `an_over_budget_task_that_yields_runs_to_the_end_without_a_wake`.
+#[test]
+fn strategy_docs_say_when_it_is_asked_and_that_a_plan_never_drops_a_poll() {
+    says(CAPITULATE, "Decides, before each poll,", "Decides, before a poll, whether a task should capitulate (not before the first poll");
+    says(CAPITULATE, "(a restore adds `Resume`)", "a just-restored task is not shown to the strategy");
+    says(CAPITULATE, "and the task is\n/// not polled.", "so the plan puts the poll off but never drops it");
 }

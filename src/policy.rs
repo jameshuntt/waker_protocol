@@ -73,7 +73,9 @@ pub struct TaskPolicy {
     /// Restore a dormant task when it is woken (the default). When false, a dormant task stays
     /// Dormant and is not polled: wakes and messages sent to it are kept in its row
     /// (`pending_wakes`, `mailbox`). Set it back to true in the task's row, and the next round
-    /// restores the task and delivers them.
+    /// restores the task and delivers them. A task the capitulation strategy checkpointed in place
+    /// of a poll it had work for is kept the same way, with its state `Runnable`, and polled once
+    /// this is back to true.
     pub auto_restore_on_wake: bool,
     /// After `Yield`, keep the task runnable so the next `run_once` or `pump` polls it again (the
     /// default); a task is polled at most once per round. When false, `Yield` parks the task
@@ -82,8 +84,9 @@ pub struct TaskPolicy {
     /// Checkpoint retention.
     pub retention: RetentionPolicy,
     /// Memory budget the default strategy enforces at Batch or lower: a task over it is
-    /// checkpointed before a poll, and after each restore it is polled once before the rule can
-    /// checkpoint it again.
+    /// checkpointed in place of a poll, and the next round restores and polls it; the rule is not
+    /// applied to that first poll after a restore. So the task gets one poll for every wake,
+    /// message or `Yield`, one round later than a task within its budget.
     pub memory_budget_hint: Option<usize>,
     /// Reserved: the scheduler does not read it yet.
     pub dormancy_ttl: Option<Duration>,

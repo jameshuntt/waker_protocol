@@ -88,7 +88,7 @@ pub enum TaskPoll {
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Where a task is in its life.
 pub enum TaskState {
-    /// Ready to be polled.
+    /// Ready to be polled; a dormant task is restored first.
     Runnable,
     /// Polled; waiting to be woken.
     Waiting,
@@ -98,8 +98,8 @@ pub enum TaskState {
     Completed,
     /// Cancelled.
     Cancelled,
-    /// Failed with an error, or with a message naming a panic in the task's own `poll`, `on_wake`
-    /// or `checkpoint`.
+    /// Failed with an error, or with a message naming a panic in the task's own
+    /// `poll`, `on_wake`, `checkpoint`, `restore` or `footprint_estimate`.
     Failed(String),
 }
 

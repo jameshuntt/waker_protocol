@@ -2,7 +2,7 @@
 //! or never fails here, and Miri reports any leak or bad read.
 
 use std::cell::{Cell, RefCell};
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{catch_unwind, panic_any, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Context;
@@ -520,14 +520,17 @@ unsafe impl ProtocolTask for Scripted {
 derive_protocol_task_vtable!(Scripted, SCRIPTED_VTABLE);
 const SCRIPTED: VTableKey = VTableKey { segment: "test", kind: "scripted", version: 1 };
 
-/// A checkpoint store whose `save` fails, whose `save` panics, or whose `remove` fails, while
-/// told to.
+/// A checkpoint store whose `save` fails or panics, whose `load` panics, or whose `remove` fails
+/// or panics, while told to; and whose `remove` always fails for one handle it is told is stuck.
 #[derive(Default)]
 struct FlakyStore {
     inner: MemoryCheckpointStore,
     failing: AtomicBool,
     panicking: AtomicBool,
+    panicking_load: AtomicBool,
     failing_remove: AtomicBool,
+    panicking_remove: AtomicBool,
+    stuck: Mutex<Option<CheckpointHandle>>,
 }
 
 impl FlakyStore {
@@ -539,8 +542,26 @@ impl FlakyStore {
         self.panicking.store(on, Ordering::SeqCst);
     }
 
+    fn panic_on_load(&self, on: bool) {
+        self.panicking_load.store(on, Ordering::SeqCst);
+    }
+
     fn fail_remove(&self, on: bool) {
         self.failing_remove.store(on, Ordering::SeqCst);
+    }
+
+    fn panic_on_remove(&self, on: bool) {
+        self.panicking_remove.store(on, Ordering::SeqCst);
+    }
+
+    /// From now on `remove` fails for `handle`, and only for it.
+    fn stick(&self, handle: CheckpointHandle) {
+        *self.stuck.lock().unwrap() = Some(handle);
+    }
+
+    /// Whether the bytes behind `handle` are still in the store.
+    fn holds(&self, handle: &CheckpointHandle) -> bool {
+        self.inner.load(handle).is_ok()
     }
 }
 
@@ -558,11 +579,17 @@ impl CheckpointStore for FlakyStore {
     }
 
     fn load(&self, handle: &CheckpointHandle) -> Result<Vec<u8>, String> {
+        if self.panicking_load.load(Ordering::SeqCst) {
+            panic!("store bug in load");
+        }
         self.inner.load(handle)
     }
 
     fn remove(&self, handle: &CheckpointHandle) -> Result<(), String> {
-        if self.failing_remove.load(Ordering::SeqCst) {
+        if self.panicking_remove.load(Ordering::SeqCst) {
+            panic!("store bug in remove");
+        }
+        if self.failing_remove.load(Ordering::SeqCst) || self.stuck.lock().unwrap().as_ref() == Some(handle) {
             return Err("remove failed".into());
         }
         self.inner.remove(handle)
@@ -882,7 +909,7 @@ fn the_strategy_sees_waiting_messages_and_wakes_before_they_are_delivered() {
 }
 
 #[test]
-fn the_idle_rule_checkpoints_a_task_with_no_waiting_work_and_a_wake_brings_it_back() {
+fn the_idle_rule_checkpoints_a_task_that_yielded_and_the_next_round_brings_it_back() {
     let mut sched = scheduler_with(MemoryCheckpointStore::default(), Box::new(eager_default_strategy()));
     let h = sched.spawn_box(SCRIPTED, Scripted::boxed(64, &[YIELD]), TaskPolicy::default()).unwrap();
     sched.run_once().unwrap(); // polled; Yield keeps it runnable
@@ -891,11 +918,11 @@ fn the_idle_rule_checkpoints_a_task_with_no_waiting_work_and_a_wake_brings_it_ba
     assert_eq!(sched.reclaim_log[0].reason, CheckpointReason::Idle);
     assert!(matches!(row(&sched, h.id()).resident, Resident::Dormant));
 
-    h.wake(WakeReason::Manual).unwrap();
+    // Its Yield asked for another poll, so it is still runnable: no wake is needed.
     sched.run_once().unwrap();
     let entry = row(&sched, h.id());
     assert_eq!(entry.stats.restore_count, 1);
-    assert_eq!(entry.stats.poll_count, 2, "woken, restored and polled");
+    assert_eq!(entry.stats.poll_count, 2, "restored and polled");
     assert_eq!(sched.reclaim_log.len(), 1);
 }
 
@@ -1140,18 +1167,44 @@ fn slab_ids_stay_stale_after_every_generation_of_a_slot_is_used() {
 const IN_POLL: u8 = 0;
 const IN_ON_WAKE: u8 = 1;
 const IN_CHECKPOINT: u8 = 2;
+const IN_RESTORE: u8 = 3;
+const IN_FOOTPRINT: u8 = 4;
+
+/// A panic payload whose own drop panics.
+struct Bomb;
+
+impl Drop for Bomb {
+    fn drop(&mut self) {
+        panic!("the payload's drop panicked");
+    }
+}
+
+/// Panic in `call`: with text naming it, or with a [`Bomb`].
+fn boom(call: &str, bomb: bool) -> ! {
+    if bomb {
+        panic_any(Bomb)
+    } else {
+        panic!("boom in {call}")
+    }
+}
 
 /// Runs calmly through its first poll and its first checkpoint, then panics in the call
-/// `panic_in` names: its next `on_wake`, its second poll, or the checkpoint its second poll asks
-/// for.
+/// `panic_in` names: its next `on_wake`, its second poll, the checkpoint its second poll asks
+/// for, any restore, or `footprint_estimate` once it has been polled. A `bomb` task panics with
+/// a [`Bomb`] instead of text.
 struct Panicky {
     panic_in: u8,
     polls: u8,
+    bomb: bool,
 }
 
 impl Panicky {
     fn boxed(panic_in: u8) -> Box<Self> {
-        Box::new(Self { panic_in, polls: 0 })
+        Box::new(Self { panic_in, polls: 0, bomb: false })
+    }
+
+    fn bomb(panic_in: u8) -> Box<Self> {
+        Box::new(Self { panic_in, polls: 0, bomb: true })
     }
 }
 
@@ -1165,7 +1218,7 @@ impl Drop for Panicky {
 unsafe impl ProtocolTask for Panicky {
     unsafe fn poll(&mut self) -> TaskPoll {
         if self.panic_in == IN_POLL && self.polls >= 1 {
-            panic!("boom in poll");
+            boom("poll", self.bomb);
         }
         self.polls += 1;
         if self.panic_in == IN_CHECKPOINT && self.polls >= 2 {
@@ -1177,19 +1230,30 @@ unsafe impl ProtocolTask for Panicky {
 
     unsafe fn on_wake(&mut self, _: WakeReason) {
         if self.panic_in == IN_ON_WAKE && self.polls >= 1 {
-            panic!("boom in on_wake");
+            boom("on_wake", self.bomb);
         }
     }
 
     unsafe fn checkpoint(&mut self) -> Vec<u8> {
         if self.panic_in == IN_CHECKPOINT && self.polls >= 2 {
-            panic!("boom in checkpoint");
+            boom("checkpoint", self.bomb);
         }
-        vec![self.panic_in, self.polls]
+        vec![self.panic_in, self.polls, u8::from(self.bomb)]
     }
 
     unsafe fn restore(bytes: &[u8]) -> Self {
-        Self { panic_in: bytes[0], polls: bytes[1] }
+        let (panic_in, polls, bomb) = (bytes[0], bytes[1], bytes[2] != 0);
+        if panic_in == IN_RESTORE {
+            boom("restore", bomb);
+        }
+        Self { panic_in, polls, bomb }
+    }
+
+    fn footprint_estimate(&self) -> usize {
+        if self.panic_in == IN_FOOTPRINT && self.polls >= 1 {
+            boom("footprint_estimate", self.bomb);
+        }
+        std::mem::size_of_val(self)
     }
 }
 
@@ -1217,14 +1281,14 @@ impl CapitulateStrategy for PanicOnQoS {
     }
 }
 
-/// Spawn a [`Panicky`] task, poll it once, checkpoint it, then wake it so it panics in
-/// `panic_in`; its first checkpoint.
+/// Spawn a [`Panicky`] task, poll it once, checkpoint it, then wake it so it panics; its first
+/// checkpoint.
 fn panic_after_a_checkpoint(
     sched: &mut WakerProtocol<MemoryCheckpointStore>,
-    panic_in: u8,
+    task: Box<Panicky>,
     policy: TaskPolicy,
 ) -> (TaskId, CheckpointHandle) {
-    let h = sched.spawn_box(PANICKY, Panicky::boxed(panic_in), policy).unwrap();
+    let h = sched.spawn_box(PANICKY, task, policy).unwrap();
     sched.run_once().unwrap();
     h.checkpoint(CheckpointReason::Manual).unwrap();
     sched.run_once().unwrap();
@@ -1243,24 +1307,30 @@ fn panic_after_a_checkpoint(
 fn the_budget_rule_lets_a_restored_task_poll_before_it_checkpoints_it_again() {
     let mut sched = scheduler();
     let policy = TaskPolicy { qos: QoSClass::Batch, memory_budget_hint: Some(1024), ..TaskPolicy::default() };
-    let h = sched.spawn_box(SCRIPTED, Scripted::boxed(2048, &[PENDING, READY]), policy).unwrap();
-    sched.run_once().unwrap(); // over budget: checkpointed before its first poll
+    let h = sched.spawn_box(SCRIPTED, Scripted::boxed(2048, &[PENDING, PENDING, READY]), policy).unwrap();
+    sched.run_once().unwrap(); // over budget: checkpointed in place of its first poll
     assert!(matches!(row(&sched, h.id()).resident, Resident::Dormant));
 
-    h.wake(WakeReason::Manual).unwrap();
+    // Spawned, it was due that poll, so the next round restores and polls it; no wake is needed.
     sched.run_once().unwrap();
     let entry = row(&sched, h.id());
     assert_eq!((entry.stats.restore_count, entry.stats.poll_count), (1, 1), "restored, then polled");
     assert!(is_live(&sched, h.id()));
 
-    // Still over budget: checkpointed again before its next poll, then restored and polled to Ready.
-    for _ in 0..2 {
+    // Still over budget: each wake checkpoints it in place of a poll, and the round after that
+    // restores and polls it. One wake, one poll.
+    for polls in 2..=3 {
         h.wake(WakeReason::Manual).unwrap();
         sched.run_once().unwrap();
+        sched.run_once().unwrap();
+        match sched.tasks.get(h.id()) {
+            Some(entry) => assert_eq!(entry.stats.poll_count, polls, "one wake, one poll"),
+            None => assert_eq!(polls, 3, "Ready on its third poll"),
+        }
     }
     assert!(sched.tasks.get(h.id()).is_none(), "it ran to the end");
     let reasons: Vec<_> = sched.reclaim_log.iter().map(|r| r.reason.clone()).collect();
-    assert_eq!(reasons, [CheckpointReason::YieldForSla, CheckpointReason::YieldForSla]);
+    assert_eq!(reasons, vec![CheckpointReason::YieldForSla; 3]);
 }
 
 #[test]
@@ -1339,7 +1409,7 @@ fn a_panic_in_a_tasks_poll_on_wake_or_checkpoint_ends_it_as_failed() {
             let before = drops();
             let retention = RetentionPolicy { retain_on_failure, ..RetentionPolicy::default() };
             let policy = TaskPolicy { retention, ..TaskPolicy::default() };
-            let (id, ckpt) = panic_after_a_checkpoint(&mut sched, panic_in, policy);
+            let (id, ckpt) = panic_after_a_checkpoint(&mut sched, Panicky::boxed(panic_in), policy);
 
             assert!(sched.tasks.get(id).is_none(), "{panic_in}: the row is removed");
             assert_eq!(drops() - before, 2, "{panic_in}: the checkpointed and restored copies, each freed once");
@@ -1417,8 +1487,240 @@ fn every_removed_task_leaves_its_final_state_in_finished() {
 fn a_task_that_panics_is_recorded_as_failed_with_a_message_naming_the_panic() {
     for (panic_in, call) in [(IN_POLL, "poll"), (IN_ON_WAKE, "on_wake"), (IN_CHECKPOINT, "checkpoint")] {
         let mut sched = scheduler();
-        let (id, _) = panic_after_a_checkpoint(&mut sched, panic_in, TaskPolicy::default());
+        let (id, _) = panic_after_a_checkpoint(&mut sched, Panicky::boxed(panic_in), TaskPolicy::default());
         let message = format!("task panicked in {call}: boom in {call}");
         assert_eq!(sched.finished, [(id, TaskState::Failed(message))]);
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// 0.3.2, second review: every panic from the task's own code is caught, even one whose payload
+// panics when dropped; a strategy checkpoint puts a poll off but never drops it; a stuck
+// checkpoint never keeps newer ones from being pruned; the docs say what a store panic leaves.
+
+#[test]
+fn a_panic_whose_payload_panics_when_dropped_still_ends_the_task_as_failed() {
+    for (panic_in, call) in [(IN_POLL, "poll"), (IN_ON_WAKE, "on_wake"), (IN_CHECKPOINT, "checkpoint")] {
+        let mut sched = scheduler();
+        let before = drops();
+        let (id, _) = catch_unwind(AssertUnwindSafe(|| {
+            panic_after_a_checkpoint(&mut sched, Panicky::bomb(panic_in), TaskPolicy::default())
+        }))
+        .unwrap_or_else(|_| panic!("{call}: the payload's drop panicked out of run_once"));
+
+        assert!(sched.tasks.get(id).is_none(), "{call}: the row is removed, never polled again");
+        let message = format!("task panicked in {call}: a panic payload that is not text");
+        assert_eq!(sched.finished, [(id, TaskState::Failed(message))], "{call}");
+        assert_eq!(drops() - before, 2, "{call}: the checkpointed and restored copies, each freed once");
+    }
+}
+
+#[test]
+fn a_panic_in_restore_ends_the_task_as_failed_and_the_round_goes_on() {
+    for (task, text) in [(Panicky::boxed(IN_RESTORE), "boom in restore"), (Panicky::bomb(IN_RESTORE), "a panic payload that is not text")] {
+        let mut sched = scheduler();
+        let before = drops();
+        let h = sched.spawn_box(PANICKY, task, TaskPolicy::default()).unwrap();
+        let background = TaskPolicy { qos: QoSClass::Background, ..TaskPolicy::default() };
+        let after = sched.spawn_box(COUNTER, Counter::boxed("after", 100), background).unwrap();
+        sched.run_once().unwrap();
+        h.checkpoint(CheckpointReason::Manual).unwrap();
+        sched.run_once().unwrap();
+        let ckpt = sched.reclaim_log[0].handle.clone().unwrap();
+
+        h.wake(WakeReason::Manual).unwrap();
+        after.wake(WakeReason::Manual).unwrap();
+        let round = catch_unwind(AssertUnwindSafe(|| sched.run_once()));
+        assert!(matches!(round, Ok(Ok(()))), "{text}: the restore's panic does not reach the caller");
+        assert!(sched.tasks.get(h.id()).is_none(), "{text}: its row is removed");
+        let message = format!("task panicked in restore: {text}");
+        assert_eq!(sched.finished, [(h.id(), TaskState::Failed(message))]);
+        assert_eq!(row(&sched, after.id()).stats.poll_count, 2, "{text}: the task after it is polled in that round");
+        assert!(sched.store.load(&ckpt).is_ok(), "{text}: retain_on_failure keeps the checkpoint that would not restore");
+        assert_eq!(drops() - before, 1, "{text}: the checkpointed copy; no restored copy was built");
+    }
+}
+
+#[test]
+fn a_panic_in_footprint_estimate_before_a_poll_ends_the_task_and_the_others_keep_running() {
+    let mut sched = scheduler();
+    let before = drops();
+    let h = sched.spawn_box(PANICKY, Panicky::boxed(IN_FOOTPRINT), TaskPolicy::default()).unwrap();
+    let background = TaskPolicy { qos: QoSClass::Background, ..TaskPolicy::default() };
+    let after = sched.spawn_box(COUNTER, Counter::boxed("after", 100), background).unwrap();
+    sched.run_once().unwrap(); // both polled; from now on the first one's footprint_estimate panics
+
+    let rounds: Vec<bool> = (0..5)
+        .map(|_| {
+            h.wake(WakeReason::Manual).unwrap();
+            after.wake(WakeReason::Manual).unwrap();
+            matches!(catch_unwind(AssertUnwindSafe(|| sched.run_once())), Ok(Ok(())))
+        })
+        .collect();
+    assert_eq!(rounds, [true; 5], "no round panics or fails");
+    assert_eq!(row(&sched, after.id()).stats.poll_count, 6, "the task after it is polled every round");
+    assert!(sched.tasks.get(h.id()).is_none());
+    let message = "task panicked in footprint_estimate: boom in footprint_estimate".to_string();
+    assert_eq!(sched.finished, [(h.id(), TaskState::Failed(message))]);
+    assert_eq!(drops() - before, 1, "the panicking task is freed once");
+}
+
+#[test]
+fn a_panic_in_footprint_estimate_during_a_checkpoint_ends_the_task_as_failed() {
+    let mut sched = scheduler();
+    let before = drops();
+    let h = sched.spawn_box(PANICKY, Panicky::boxed(IN_FOOTPRINT), TaskPolicy::default()).unwrap();
+    sched.run_once().unwrap();
+
+    h.checkpoint(CheckpointReason::Manual).unwrap();
+    let round = catch_unwind(AssertUnwindSafe(|| sched.run_once()));
+    assert!(matches!(round, Ok(Ok(()))), "the panic does not reach the caller");
+    assert!(sched.tasks.get(h.id()).is_none());
+    let message = "task panicked in footprint_estimate: boom in footprint_estimate".to_string();
+    assert_eq!(sched.finished, [(h.id(), TaskState::Failed(message))]);
+    assert!(sched.reclaim_log.is_empty(), "nothing was saved");
+    assert_eq!(drops() - before, 1);
+}
+
+/// Batch, with a budget of 0 bytes: any task is over it, so the default strategy checkpoints it
+/// whenever it is asked.
+fn over_budget() -> TaskPolicy {
+    TaskPolicy { qos: QoSClass::Batch, memory_budget_hint: Some(0), ..TaskPolicy::default() }
+}
+
+#[test]
+fn every_message_to_an_over_budget_task_gets_a_poll() {
+    let mut sched = scheduler();
+    let h = sched.spawn_box(COUNTER, Counter::boxed("w", 100), over_budget()).unwrap();
+    sched.run_once().unwrap();
+    sched.run_once().unwrap();
+
+    let mut polls = Vec::new();
+    let mut orders = Vec::new();
+    for _ in 0..4 {
+        clear_order();
+        h.send("note", "job", note).unwrap();
+        for _ in 0..3 {
+            sched.run_once().unwrap();
+        }
+        polls.push(row(&sched, h.id()).stats.poll_count);
+        orders.push(order());
+    }
+    assert_eq!(polls, [2, 3, 4, 5], "the spawn and each message got one poll");
+    assert_eq!(orders, [["job", "restored"]; 4], "each message is delivered, then a poll acts on it");
+}
+
+#[test]
+fn an_over_budget_task_that_yields_runs_to_the_end_without_a_wake() {
+    let mut sched = scheduler();
+    let h = sched.spawn_box(SCRIPTED, Scripted::boxed(64, &[YIELD, YIELD, YIELD, READY]), over_budget()).unwrap();
+    for _ in 0..20 {
+        sched.run_once().unwrap();
+    }
+    assert!(sched.tasks.get(h.id()).is_none(), "every Yield got its next poll");
+    assert_eq!(sched.finished, [(h.id(), TaskState::Completed)]);
+}
+
+#[test]
+fn a_task_woken_only_by_qos_or_memory_pressure_stays_dormant_after_the_strategy_checkpoints_it() {
+    let plan = CapitulatePlan { reason: CheckpointReason::QoS, retain_stub: true };
+    let mut sched = scheduler_with(MemoryCheckpointStore::default(), Box::new(OnQoS(plan)));
+    let by_qos = sched.spawn_box(SCRIPTED, Scripted::boxed(8192, &[PENDING]), TaskPolicy::default()).unwrap();
+    let mut default = scheduler();
+    let by_pressure = default.spawn_box(SCRIPTED, Scripted::boxed(8192, &[PENDING]), TaskPolicy::default()).unwrap();
+    sched.run_once().unwrap();
+    default.run_once().unwrap();
+
+    by_qos.wake(WakeReason::QoS).unwrap();
+    by_pressure.wake(WakeReason::MemoryPressure).unwrap();
+    for _ in 0..3 {
+        sched.run_once().unwrap();
+        default.run_once().unwrap();
+    }
+    for entry in [row(&sched, by_qos.id()), row(&default, by_pressure.id())] {
+        assert!(matches!(entry.resident, Resident::Dormant), "the checkpoint answered the wake");
+        assert_eq!(entry.state, TaskState::Dormant);
+        assert_eq!((entry.stats.restore_count, entry.stats.poll_count), (0, 1), "not restored for it");
+    }
+}
+
+#[test]
+fn a_stuck_checkpoint_never_keeps_newer_ones_from_being_pruned() {
+    let mut sched = flaky();
+    let h = sched.spawn_box(SCRIPTED, Scripted::boxed(64, &[CHECKPOINT]), TaskPolicy::default()).unwrap();
+    sched.run_once().unwrap(); // first checkpoint
+    sched.store.stick(sched.reclaim_log[0].handle.clone().unwrap());
+
+    for _ in 0..3 {
+        h.wake(WakeReason::Manual).unwrap();
+        assert_eq!(sched.run_once().unwrap_err(), "remove failed", "the stuck one fails again");
+    }
+    let ckpts: Vec<_> = sched.reclaim_log.iter().map(|r| r.handle.clone().unwrap()).collect();
+    assert_eq!(row(&sched, h.id()).checkpoint_history, [ckpts[0].clone(), ckpts[3].clone()], "the stuck one and the latest");
+    let held: Vec<bool> = ckpts.iter().map(|c| sched.store.holds(c)).collect();
+    assert_eq!(held, [true, false, false, true], "every checkpoint between them is removed");
+}
+
+#[test]
+fn a_panic_from_the_stores_load_or_remove_reaches_the_caller_and_leaves_the_task_as_the_docs_say() {
+    // load: the task stays dormant.
+    let mut sched = flaky();
+    let h = sched.spawn_box(COUNTER, Counter::boxed("l", 100), TaskPolicy::default()).unwrap();
+    sched.run_once().unwrap();
+    h.checkpoint(CheckpointReason::Manual).unwrap();
+    sched.run_once().unwrap();
+    sched.store.panic_on_load(true);
+    h.wake(WakeReason::Manual).unwrap();
+    assert!(catch_unwind(AssertUnwindSafe(|| sched.run_once())).is_err(), "load's panic reaches the caller");
+    assert!(matches!(row(&sched, h.id()).resident, Resident::Dormant), "the task stays dormant");
+    sched.store.panic_on_load(false);
+    sched.run_once().unwrap();
+    assert!(is_live(&sched, h.id()), "and is restored once load works");
+
+    // remove, while a checkpoint prunes: the task is already dormant, and the checkpoint not yet
+    // removed stays in its history.
+    let before = drops();
+    sched.store.panic_on_remove(true);
+    h.checkpoint(CheckpointReason::Manual).unwrap();
+    assert!(catch_unwind(AssertUnwindSafe(|| sched.run_once())).is_err(), "remove's panic reaches the caller");
+    let entry = row(&sched, h.id());
+    assert!(matches!(entry.resident, Resident::Dormant), "the task is already dormant");
+    assert_eq!(drops() - before, 1, "its live copy is freed once");
+    let ckpts: Vec<_> = sched.reclaim_log.iter().map(|r| r.handle.clone().unwrap()).collect();
+    assert_eq!(entry.checkpoint_history, ckpts, "the older checkpoint is still in its history");
+
+    // remove, at the task's end: the task is already removed and freed; the checkpoints not yet
+    // removed stay in the store.
+    sched.store.panic_on_remove(false);
+    h.wake(WakeReason::Manual).unwrap();
+    sched.run_once().unwrap(); // restored and polled
+    let before = drops();
+    sched.store.panic_on_remove(true);
+    h.cancel().unwrap();
+    assert!(catch_unwind(AssertUnwindSafe(|| sched.run_once())).is_err(), "remove's panic reaches the caller");
+    assert!(sched.tasks.get(h.id()).is_none(), "the task is already removed");
+    assert_eq!(drops() - before, 1, "and freed once");
+    assert_eq!(sched.finished, [(h.id(), TaskState::Cancelled)]);
+    assert!(ckpts.iter().all(|c| sched.store.holds(c)), "its checkpoints are left in the store");
+}
+
+#[test]
+fn the_strategy_is_never_shown_a_task_just_restored() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let strategy = Recording { seen: seen.clone(), inner: DefaultCapitulateStrategy::default() };
+    let mut sched = scheduler_with(MemoryCheckpointStore::default(), Box::new(strategy));
+    let h = sched.spawn_box(COUNTER, Counter::boxed("r", 100), TaskPolicy::default()).unwrap();
+    sched.run_once().unwrap(); // asked: spawned
+    for _ in 0..3 {
+        h.checkpoint(CheckpointReason::Manual).unwrap();
+        sched.run_once().unwrap();
+        h.wake(WakeReason::Manual).unwrap();
+        sched.run_once().unwrap(); // restored and polled: not asked
+        h.wake(WakeReason::Manual).unwrap();
+        sched.run_once().unwrap(); // asked
+    }
+    let entry = row(&sched, h.id());
+    assert_eq!((entry.stats.restore_count, entry.stats.poll_count), (3, 7));
+    let pending: Vec<_> = seen.lock().unwrap().iter().map(|s| s.pending_wakes).collect();
+    assert_eq!(pending, [1, 1, 1, 1], "asked for 4 of the 7 polls, never with a restore's Resume counted");
 }

@@ -26,7 +26,8 @@ pub struct TaskSnapshot {
     pub footprint_bytes: usize,
     /// Messages waiting for it, counted before this round delivers them.
     pub mailbox_len: usize,
-    /// Wakes waiting for it, counted before this round delivers them (a restore adds `Resume`).
+    /// Wakes waiting for it, counted before this round delivers them. A restore's `Resume` is
+    /// never counted: a just-restored task is not shown to the strategy.
     pub pending_wakes: usize,
     /// How many times it was polled.
     pub poll_count: u64,
@@ -53,12 +54,18 @@ pub struct ReclaimReport<H> {
     pub handle: Option<H>,
 }
 
-/// Decides, before each poll, whether a task should capitulate.
+/// Decides, before a poll, whether a task should capitulate (not before the first poll after a
+/// restore).
 ///
 /// It sees the task as it was before this round's messages and wakes were delivered, and
 /// `last_wake` is the newest wake the task has been sent, this round's included. If it returns a
 /// plan, the messages and wakes are delivered first, so the checkpoint holds them, and the task is
-/// not polled.
+/// not polled in this round.
+///
+/// A task the plan checkpoints that had work waiting (a message, a wake other than `QoS` or
+/// `MemoryPressure`, or a `Yield` and no wake since) stays runnable while dormant: the next round
+/// restores and polls it, so the plan puts the poll off but never drops it. A task woken only by
+/// `QoS` or `MemoryPressure` is answered by the checkpoint and stays dormant until its next wake.
 ///
 /// It is not asked about a task restored from a checkpoint until that task has been polled once,
 /// so a plan that holds for the task's whole life (such as the default budget rule) still lets it

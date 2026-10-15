@@ -54,14 +54,22 @@ and nothing more, and `restore` must accept any bytes the checkpoint store retur
 
 ## 0.3.2
 
-Fixes from a review of 0.3.1. No public signature changed; `WakerProtocol` has one new public
+Fixes from two reviews of 0.3.1. No public signature changed; `WakerProtocol` has one new public
 field, `finished`.
 
 - **A restored task runs before it can be checkpointed again.** The capitulation strategy is not
   asked about a task restored from a checkpoint until that task has been polled once, whatever
   the strategy. In 0.3.1 the default budget rule checkpointed an over-budget Batch or Background
-  task before every poll, including right after each restore, so the task never ran again. Now
-  such a task runs once after each restore.
+  task before every poll, including right after each restore, so the task never ran again.
+- **A strategy checkpoint puts a poll off; it never drops it.** When the strategy checkpoints a
+  task instead of polling it, and the task had work waiting (a message, a wake other than `QoS`
+  or `MemoryPressure`, or a `Yield` and no wake since), the task stays runnable while dormant:
+  the next round restores it and polls it. So an over-budget Batch task gets one poll for every
+  wake, every message and every `Yield`, a round later than a task within its budget. A task
+  woken only by `QoS` or `MemoryPressure` is answered by the checkpoint and stays dormant until
+  its next wake, so a memory-pressure reclaim is not undone the round after. In 0.3.1 such a
+  task was left dormant with its work delivered but not acted on, until another wake; a task
+  that yielded and was checkpointed this way never ran again.
 - **A dormant task without auto-restore stays dormant.** With `auto_restore_on_wake` off, a wake
   or a message sent to a dormant task is kept in its row (`pending_wakes`, `mailbox`), and the
   task stays `Dormant` and out of the ready list. Set `auto_restore_on_wake` back to true in its
@@ -69,22 +77,38 @@ field, `finished`.
   `Runnable`, so it sat in the ready list every round and nothing happened.
 - **A checkpoint the store cannot remove is kept and tried again.** When old checkpoints are
   pruned and the store's `remove` fails for one, that handle stays in the task's
-  `checkpoint_history`, the error is returned, and the next prune tries it again. In 0.3.1 the
-  handle was already gone from the history, so its bytes stayed in the store for good. When a
-  task ends, its history goes with its row: a removal that fails then is returned as an error but
-  not tried again (the handle is still in `reclaim_log`).
+  `checkpoint_history`, the error is returned, and the next prune tries it again. Newer handles
+  past `keep_latest` are still removed, so a handle that stays stuck never holds them back. In
+  0.3.1 the handle was already gone from the history, so its bytes stayed in the store for good.
+  When a task ends, its history goes with its row: a removal that fails then is returned as an
+  error but not tried again (the handle is still in `reclaim_log`).
 - **`finished` says how every task ended.** `WakerProtocol::finished` lists every task the
   scheduler removed, oldest first, with the state it ended in: `Completed`, `Cancelled`, or
   `Failed` with its message. In 0.3.1 a `Failed` message was lost when the row was removed. Like
   `reclaim_log` it only grows; clear it once read.
-- **A panic no longer leaves an empty row.** A panic in a task's own `poll`, `on_wake` or
-  `checkpoint` is caught: the task ends as `Failed`, with a message naming the panic
-  (`task panicked in poll: ...`), its checkpoints follow `retain_on_failure`, and its row is
-  removed. A panic from the checkpoint store or the capitulation strategy still reaches the
-  caller, but the task is put back in its row, live, first, so the scheduler still works if the
-  caller catches the panic. In 0.3.1 each of these panics freed the task and left its row as
-  `Resident::Empty` for good.
-- **Tests.** A test for each fix above. Each was run against 0.3.1 first, where it fails.
+- **A panic in the task's own code ends only that task.** A panic in a task's `poll`,
+  `on_wake`, `checkpoint`, `restore` or `footprint_estimate` is caught: the task ends as
+  `Failed`, with a message naming the panic (`task panicked in poll: ...`), its checkpoints
+  follow `retain_on_failure`, its row is removed, and the round goes on to the other tasks. That
+  holds even when the panic's payload panics again as it is dropped. A `restore` that panics
+  ends the task for good, because its checkpoint will never restore; in 0.3.1 every later round
+  panicked at the same restore, and no task after it in the round was polled.
+- **What a panic from the checkpoint store leaves.** A panic from the store's `save` or from the
+  capitulation strategy still reaches the caller, but the task is put back in its row, live,
+  first, so the scheduler still works if the caller catches the panic. A panic from the store's
+  `load` also reaches the caller, and the task stays dormant. A panic from the store's `remove`
+  comes after the task is already dormant (a checkpoint) or already removed and freed (the task's
+  end); the checkpoints it had not yet removed stay in the store, and in a dormant task's history,
+  where a later prune tries them again. In 0.3.1 a panic in the task's own `poll`, `on_wake`,
+  `checkpoint` or `footprint_estimate`, in the strategy, or in the store's `save` freed the task
+  and left its row as `Resident::Empty` for good; a panic from `load` or `remove` did then what
+  it does now.
+- **Strategy docs.** `CapitulateStrategy` is asked before a poll, but not before the first poll
+  after a restore, and `TaskSnapshot::pending_wakes` never counts a restore's `Resume`; the docs
+  said "before each poll" and "a restore adds `Resume`".
+- **Tests.** A test for each fix above, each run against the code before the fix first, where it
+  fails. The test for a handle that stays stuck passed before too, because that code was right;
+  it fails on a prune that keeps retrying the stuck handle, which the earlier test did not catch.
 
 ## 0.3.1
 

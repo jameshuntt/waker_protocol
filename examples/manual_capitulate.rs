@@ -18,6 +18,7 @@ impl ChunkReducer {
     }
 }
 
+// SAFETY: the functions only touch `self`, and `restore` panics rather than misreading short bytes.
 unsafe impl ProtocolTask for ChunkReducer {
     unsafe fn poll(&mut self) -> TaskPoll {
         if self.pressure || self.data.capacity() > self.soft_limit {
@@ -113,6 +114,12 @@ fn main() -> Result<(), String> {
     handle.wake(WakeReason::Resume)?;
     sched.run_once()?; // restores and continues
 
-    println!("reclaim events = {}", sched.reclaim_log.len());
+    for event in &sched.reclaim_log {
+        println!("task {:?} reclaimed {} bytes for {:?}", event.id, event.reclaimed_bytes, event.reason);
+    }
+    let first = sched.reclaim_log.first().expect("the scenario reclaims the task");
+    assert_eq!(first.id, handle.id());
+    assert_eq!(first.reason, waker_protocol::CheckpointReason::MemoryPressure);
+    assert_eq!(sched.tasks.get(handle.id()).unwrap().stats.restore_count, 1);
     Ok(())
 }

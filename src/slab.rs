@@ -5,6 +5,7 @@ struct Slot<T> {
     value: Option<T>,
 }
 
+/// Slots of `T`, each reused with a new generation so an old id cannot reach a new value.
 pub struct TaskSlab<T> {
     slots: Vec<Slot<T>>,
     free: Vec<u32>,
@@ -20,6 +21,7 @@ impl<T> Default for TaskSlab<T> {
 }
 
 impl<T> TaskSlab<T> {
+    /// Store `value`; its id.
     pub fn insert(&mut self, value: T) -> TaskId {
         if let Some(slot_idx) = self.free.pop() {
             let slot = &mut self.slots[slot_idx as usize];
@@ -35,6 +37,7 @@ impl<T> TaskSlab<T> {
         }
     }
 
+    /// The value under `id`, if `id` is current.
     pub fn get(&self, id: TaskId) -> Option<&T> {
         let slot = self.slots.get(id.slot as usize)?;
         if slot.generation == id.generation {
@@ -44,6 +47,7 @@ impl<T> TaskSlab<T> {
         }
     }
 
+    /// The value under `id`, if `id` is current.
     pub fn get_mut(&mut self, id: TaskId) -> Option<&mut T> {
         let slot = self.slots.get_mut(id.slot as usize)?;
         if slot.generation == id.generation {
@@ -53,6 +57,7 @@ impl<T> TaskSlab<T> {
         }
     }
 
+    /// Take the value under `id` out and retire the id.
     pub fn remove(&mut self, id: TaskId) -> Option<T> {
         let slot = self.slots.get_mut(id.slot as usize)?;
         if slot.generation != id.generation {
@@ -65,6 +70,7 @@ impl<T> TaskSlab<T> {
         Some(value)
     }
 
+    /// Every current id.
     pub fn live_ids(&self) -> Vec<TaskId> {
         let mut out = Vec::new();
 

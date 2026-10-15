@@ -11,6 +11,7 @@ struct BlobTask {
     pressure: bool,
 }
 
+// SAFETY: the functions only touch `self`, and `restore` panics rather than misreading short bytes.
 unsafe impl ProtocolTask for BlobTask {
     unsafe fn poll(&mut self) -> TaskPoll {
         if self.pressure || self.buffer.len() > 4096 {
@@ -96,5 +97,12 @@ fn main() -> Result<(), String> {
     task.wake(WakeReason::Resume)?;
     sched.run_once()?; // restore + continue
 
+    for event in &sched.reclaim_log {
+        println!("task {:?} reclaimed {} bytes for {:?}", event.id, event.reclaimed_bytes, event.reason);
+    }
+    let first = sched.reclaim_log.first().expect("the scenario reclaims the task");
+    assert_eq!(first.id, task.id());
+    assert_eq!(first.reason, waker_protocol::CheckpointReason::MemoryPressure);
+    assert_eq!(sched.tasks.get(task.id()).unwrap().stats.restore_count, 1);
     Ok(())
 }

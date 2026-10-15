@@ -12,6 +12,7 @@ struct BatchCompactor {
     current: usize,
 }
 
+// SAFETY: the functions only touch `self`, and `restore` panics rather than misreading short bytes.
 unsafe impl ProtocolTask for BatchCompactor {
     unsafe fn poll(&mut self) -> TaskPoll {
         if self.current >= self.pages.len() {
@@ -106,9 +107,11 @@ fn main() -> Result<(), String> {
 
     sched.register_vtable(key, &BATCH_COMPACTOR_VTABLE);
 
-    let mut policy = TaskPolicy::default();
-    policy.qos = QoSClass::Background;
-    policy.memory_budget_hint = Some(4096);
+    let policy = TaskPolicy {
+        qos: QoSClass::Background,
+        memory_budget_hint: Some(4096),
+        ..TaskPolicy::default()
+    };
 
     let handle = sched.spawn_box(
         key,
@@ -125,6 +128,12 @@ fn main() -> Result<(), String> {
     handle.wake(WakeReason::Resume)?;
     sched.run_once()?; // restore + continue
 
-    println!("reclaim events = {}", sched.reclaim_log.len());
+    for event in &sched.reclaim_log {
+        println!("task {:?} reclaimed {} bytes for {:?}", event.id, event.reclaimed_bytes, event.reason);
+    }
+    let first = sched.reclaim_log.first().expect("the scenario reclaims the task");
+    assert_eq!(first.id, handle.id());
+    assert_eq!(first.reason, waker_protocol::CheckpointReason::YieldForSla);
+    assert_eq!(sched.tasks.get(handle.id()).unwrap().stats.restore_count, 1);
     Ok(())
 }

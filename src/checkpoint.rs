@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
+/// A key into a [`MemoryCheckpointStore`].
 pub struct CheckpointHandle(pub String);
 
 impl fmt::Debug for CheckpointHandle {
@@ -13,14 +14,20 @@ impl fmt::Debug for CheckpointHandle {
     }
 }
 
+/// Where checkpoint bytes are kept.
 pub trait CheckpointStore: Send + Sync + 'static {
+    /// What `save` hands back to find the bytes again.
     type Handle: Clone + fmt::Debug + Send + Sync + 'static;
 
+    /// Keep `payload` for `task_id`.
     fn save(&self, task_id: TaskId, payload: Vec<u8>) -> Result<Self::Handle, String>;
+    /// The bytes `handle` points at.
     fn load(&self, handle: &Self::Handle) -> Result<Vec<u8>, String>;
+    /// Forget the bytes `handle` points at.
     fn remove(&self, handle: &Self::Handle) -> Result<(), String>;
 }
 
+/// Checkpoints held in memory, keyed by task and a running number.
 pub struct MemoryCheckpointStore {
     next: AtomicU64,
     inner: RwLock<HashMap<String, Vec<u8>>>,

@@ -13,6 +13,7 @@ use std::sync::RwLock;
 use std::time::{Duration, Instant};
 use waker_tables::VTableKey;
 
+/// Task vtables by key. Registering replaces; tasks already spawned keep theirs.
 pub struct ProtocolVTableRegistry {
     inner: RwLock<BTreeMap<VTableKey, &'static ProtocolVTable>>,
 }
@@ -26,36 +27,53 @@ impl Default for ProtocolVTableRegistry {
 }
 
 impl ProtocolVTableRegistry {
+    /// Register `vtable` under `key`.
     pub fn register(&self, key: VTableKey, vtable: &'static ProtocolVTable) {
         let mut guard = self.inner.write().expect("protocol vtable registry poisoned");
         guard.insert(key, vtable);
     }
 
+    /// The vtable under `key`.
     pub fn get(&self, key: &VTableKey) -> Option<&'static ProtocolVTable> {
         let guard = self.inner.read().expect("protocol vtable registry poisoned");
         guard.get(key).copied()
     }
 }
 
+/// Where a task's memory is.
 pub enum Resident {
+    /// In memory.
     Live(ProtocolTaskPtr),
+    /// Checkpointed out; restored when woken (by policy).
     Dormant,
+    /// Gone, or out for a poll.
     Empty,
 }
 
+/// One task's row in the scheduler.
 pub struct TaskEntry<H> {
+    /// The key it was spawned under.
     pub key: VTableKey,
+    /// Its type's vtable, used to restore it.
     pub vtable: &'static ProtocolVTable,
+    /// Where its memory is.
     pub resident: Resident,
 
+    /// Its state.
     pub state: TaskState,
+    /// Its policy.
     pub policy: TaskPolicy,
+    /// Its counters.
     pub stats: TaskStats,
 
+    /// Messages waiting for its next poll.
     pub mailbox: VecDeque<EnvelopePacket>,
+    /// Wakes waiting for its next poll.
     pub pending_wakes: VecDeque<WakeReason>,
+    /// Its checkpoints, oldest first.
     pub checkpoint_history: VecDeque<H>,
 
+    /// When it last became runnable; breaks ties in the poll order.
     pub runnable_seq: u64,
 }
 
@@ -96,39 +114,46 @@ impl<H> TaskEntry<H> {
 }
 
 #[derive(Clone)]
+/// Sends messages to a scheduler from anywhere.
 pub struct SchedulerHandle {
     tx: Sender<SchedulerMsg>,
 }
 
 impl SchedulerHandle {
+    /// Wake task `id`.
     pub fn wake(&self, id: TaskId, reason: WakeReason) -> Result<(), String> {
         self.tx
             .send(SchedulerMsg::Wake { id, reason })
             .map_err(|e| e.to_string())
     }
 
+    /// Checkpoint task `id`.
     pub fn checkpoint(&self, id: TaskId, reason: CheckpointReason) -> Result<(), String> {
         self.tx
             .send(SchedulerMsg::Checkpoint { id, reason })
             .map_err(|e| e.to_string())
     }
 
+    /// Make task `id` capitulate.
     pub fn capitulate(&self, id: TaskId, plan: CapitulatePlan) -> Result<(), String> {
         self.tx
             .send(SchedulerMsg::Capitulate { id, plan })
             .map_err(|e| e.to_string())
     }
 
+    /// Cancel task `id`.
     pub fn cancel(&self, id: TaskId) -> Result<(), String> {
         self.tx
             .send(SchedulerMsg::Cancel { id })
             .map_err(|e| e.to_string())
     }
 
+    /// Checkpoint every task and stop.
     pub fn shutdown(&self) -> Result<(), String> {
         self.tx.send(SchedulerMsg::Shutdown).map_err(|e| e.to_string())
     }
 
+    /// A thread that wakes task `id` with `WakeReason::Timer` every `every`, until the scheduler is gone.
     pub fn spawn_interval_waker(
         &self,
         id: TaskId,
@@ -152,6 +177,7 @@ impl SchedulerHandle {
     }
 }
 
+/// A handle to one spawned task of type `T`.
 pub struct TaskHandle<T> {
     id: TaskId,
     tx: Sender<SchedulerMsg>,
@@ -169,10 +195,12 @@ impl<T> Clone for TaskHandle<T> {
 }
 
 impl<T: ProtocolTask> TaskHandle<T> {
+    /// The task's id.
     pub fn id(&self) -> TaskId {
         self.id
     }
 
+    /// Wake the task.
     pub fn wake(&self, reason: WakeReason) -> Result<(), String> {
         self.tx
             .send(SchedulerMsg::Wake {
@@ -182,6 +210,7 @@ impl<T: ProtocolTask> TaskHandle<T> {
             .map_err(|e| e.to_string())
     }
 
+    /// Checkpoint the task.
     pub fn checkpoint(&self, reason: CheckpointReason) -> Result<(), String> {
         self.tx
             .send(SchedulerMsg::Checkpoint {
@@ -191,6 +220,7 @@ impl<T: ProtocolTask> TaskHandle<T> {
             .map_err(|e| e.to_string())
     }
 
+    /// Make the task capitulate.
     pub fn capitulate(&self, plan: CapitulatePlan) -> Result<(), String> {
         self.tx
             .send(SchedulerMsg::Capitulate {
@@ -200,12 +230,14 @@ impl<T: ProtocolTask> TaskHandle<T> {
             .map_err(|e| e.to_string())
     }
 
+    /// Cancel the task.
     pub fn cancel(&self) -> Result<(), String> {
         self.tx
             .send(SchedulerMsg::Cancel { id: self.id })
             .map_err(|e| e.to_string())
     }
 
+    /// Send the task a message; `deliver` runs with the task before its next poll.
     pub fn send<M: Send + 'static>(
         &self,
         kind: &'static str,
@@ -221,12 +253,19 @@ impl<T: ProtocolTask> TaskHandle<T> {
     }
 }
 
+/// The scheduler.
 pub struct WakerProtocol<S: CheckpointStore> {
+    /// Task vtables by key.
     pub registry: ProtocolVTableRegistry,
+    /// The tasks.
     pub tasks: TaskSlab<TaskEntry<S::Handle>>,
+    /// Every reclaim so far.
     pub reclaim_log: Vec<ReclaimReport<S::Handle>>,
+    /// Settings.
     pub config: SchedulerConfig,
+    /// Where checkpoints go.
     pub store: S,
+    /// Set by a Shutdown message.
     pub shutdown: bool,
 
     strategy: Box<dyn CapitulateStrategy>,
@@ -237,10 +276,12 @@ pub struct WakerProtocol<S: CheckpointStore> {
 }
 
 impl<S: CheckpointStore> WakerProtocol<S> {
+    /// A scheduler with the default capitulation strategy.
     pub fn new(store: S) -> Self {
         Self::with_strategy(store, Box::new(DefaultCapitulateStrategy::default()))
     }
 
+    /// A scheduler with your own capitulation strategy.
     pub fn with_strategy(store: S, strategy: Box<dyn CapitulateStrategy>) -> Self {
         let (tx, rx) = unbounded();
 
@@ -259,16 +300,27 @@ impl<S: CheckpointStore> WakerProtocol<S> {
         }
     }
 
+    /// The scheduler's own channel, for [`scheduler_waker`](crate::scheduler_waker) or a hand-built
+    /// [`SchedulerMsg`]. A message for a task of another type is refused when it would be delivered.
+    pub fn sender(&self) -> Sender<SchedulerMsg> {
+        self.tx.clone()
+    }
+
+    /// A handle for sending messages to this scheduler.
     pub fn handle(&self) -> SchedulerHandle {
         SchedulerHandle {
             tx: self.tx.clone(),
         }
     }
 
+    /// Register `vtable` under `key`.
     pub fn register_vtable(&self, key: VTableKey, vtable: &'static ProtocolVTable) {
         self.registry.register(key, vtable);
     }
 
+    /// Spawn `task` with the vtable registered under `key`.
+    ///
+    /// Refuses a key that is not registered, or whose vtable runs another type.
     pub fn spawn_box<T: ProtocolTask>(
         &mut self,
         key: VTableKey,
@@ -279,6 +331,14 @@ impl<S: CheckpointStore> WakerProtocol<S> {
             .registry
             .get(&key)
             .ok_or_else(|| format!("no protocol vtable registered for {:?}", key))?;
+        if !vtable.is_for::<T>() {
+            return Err(format!(
+                "protocol vtable for {:?} is for {}, not {}",
+                key,
+                vtable.type_name(),
+                std::any::type_name::<T>()
+            ));
+        }
 
         let entry = TaskEntry::new(
             key,
@@ -297,12 +357,14 @@ impl<S: CheckpointStore> WakerProtocol<S> {
         })
     }
 
+    /// Handle every queued message, then poll every runnable task once.
     pub fn run_once(&mut self) -> Result<(), String> {
         self.drain_inbox()?;
         self.poll_ready()?;
         Ok(())
     }
 
+    /// Wait up to `timeout` for a message, then run once. False once shut down or every handle is gone.
     pub fn pump(&mut self, timeout: Duration) -> Result<bool, String> {
         if self.shutdown {
             return Ok(false);
@@ -361,6 +423,8 @@ impl<S: CheckpointStore> WakerProtocol<S> {
                 if let Some(entry) = self.tasks.get_mut(id) {
                     entry.state = TaskState::Cancelled;
                 }
+                // Removing the row frees the task; its checkpoints follow the retention policy.
+                self.finalize_removal(id)?;
             }
             SchedulerMsg::Shutdown => {
                 self.shutdown = true;
@@ -462,7 +526,7 @@ impl<S: CheckpointStore> WakerProtocol<S> {
 
         let handle = latest_handle.ok_or_else(|| format!("dormant task {:?} missing checkpoint", id))?;
         let bytes = self.store.load(&handle)?;
-        let restored = unsafe { ProtocolTaskPtr::restore_from_bytes(vtable, &bytes) };
+        let restored = ProtocolTaskPtr::restore_from_bytes(vtable, &bytes);
 
         if let Some(entry) = self.tasks.get_mut(id) {
             entry.resident = Resident::Live(restored);
@@ -486,7 +550,7 @@ impl<S: CheckpointStore> WakerProtocol<S> {
             id,
             qos: entry.policy.qos,
             state: entry.state.clone(),
-            footprint_bytes: unsafe { live.footprint_estimate() },
+            footprint_bytes: live.footprint_estimate(),
             mailbox_len: entry.mailbox.len(),
             pending_wakes: entry.pending_wakes.len(),
             poll_count: entry.stats.poll_count,
@@ -503,7 +567,8 @@ impl<S: CheckpointStore> WakerProtocol<S> {
 
         match resident {
             Resident::Live(mut live) => {
-                let before_bytes = unsafe { live.footprint_estimate() };
+                let before_bytes = live.footprint_estimate();
+                // SAFETY: `live` is out of the slab, so this call has exclusive access to a live task (ProtocolTask's contract).
                 let payload = unsafe { live.checkpoint() };
                 let handle = self.store.save(id, payload)?;
 
@@ -602,11 +667,22 @@ impl<S: CheckpointStore> WakerProtocol<S> {
             let entry = self.tasks.get_mut(id).unwrap();
 
             while let Some(env) = entry.mailbox.pop_front() {
-                env.dispatch(unsafe { live.raw_data() })?;
+                if env.target_type() != live.task_type_id() {
+                    return Err(format!(
+                        "envelope {:?} for task {:?} targets another task type than {}",
+                        env.kind(),
+                        id,
+                        live.vtable().type_name()
+                    ));
+                }
+                // SAFETY: the envelope targets exactly the type `live` holds (checked above),
+                // and `live` is out of the slab, so this access is exclusive.
+                unsafe { env.dispatch(live.raw_data())? };
             }
 
             while let Some(reason) = entry.pending_wakes.pop_front() {
                 entry.stats.last_wake = Some(reason.clone());
+                // SAFETY: `live` is out of the slab, so this call has exclusive access to a live task (ProtocolTask's contract).
                 unsafe { live.on_wake(reason) };
             }
         }
@@ -616,6 +692,7 @@ impl<S: CheckpointStore> WakerProtocol<S> {
             let snapshot = self.snapshot_for(id, entry, &live);
             if let Some(plan) = self.strategy.plan(&snapshot, entry.stats.last_wake.as_ref()) {
                 let before_bytes = snapshot.footprint_bytes;
+                // SAFETY: `live` is out of the slab, so this call has exclusive access to a live task (ProtocolTask's contract).
                 let payload = unsafe { live.checkpoint() };
                 let handle = self.store.save(id, payload)?;
 
@@ -655,6 +732,7 @@ impl<S: CheckpointStore> WakerProtocol<S> {
             entry.stats.last_polled_at = Some(Instant::now());
         }
 
+        // SAFETY: `live` is out of the slab, so this call has exclusive access to a live task (ProtocolTask's contract).
         let poll = unsafe { live.poll() };
 
         match poll {
@@ -687,7 +765,8 @@ impl<S: CheckpointStore> WakerProtocol<S> {
                 Ok(false)
             }
             TaskPoll::Checkpoint(reason) => {
-                let before_bytes = unsafe { live.footprint_estimate() };
+                let before_bytes = live.footprint_estimate();
+                // SAFETY: `live` is out of the slab, so this call has exclusive access to a live task (ProtocolTask's contract).
                 let payload = unsafe { live.checkpoint() };
                 let handle = self.store.save(id, payload)?;
 
@@ -721,7 +800,8 @@ impl<S: CheckpointStore> WakerProtocol<S> {
             }
             TaskPoll::Capitulate(plan) => {
                 if plan.retain_stub {
-                    let before_bytes = unsafe { live.footprint_estimate() };
+                    let before_bytes = live.footprint_estimate();
+                    // SAFETY: `live` is out of the slab, so this call has exclusive access to a live task (ProtocolTask's contract).
                     let payload = unsafe { live.checkpoint() };
                     let handle = self.store.save(id, payload)?;
 

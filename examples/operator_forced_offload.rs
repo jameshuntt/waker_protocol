@@ -10,6 +10,7 @@ struct AnalyticsTask {
     cursor: usize,
 }
 
+// SAFETY: the functions only touch `self`, and `restore` panics rather than misreading short bytes.
 unsafe impl ProtocolTask for AnalyticsTask {
     unsafe fn poll(&mut self) -> TaskPoll {
         if self.cursor >= self.working_set.len() {
@@ -76,6 +77,12 @@ fn main() -> Result<(), String> {
     handle.wake(WakeReason::Resume)?;
     sched.run_once()?; // restore and continue
 
-    println!("reclaim events = {}", sched.reclaim_log.len());
+    for event in &sched.reclaim_log {
+        println!("task {:?} reclaimed {} bytes for {:?}", event.id, event.reclaimed_bytes, event.reason);
+    }
+    let first = sched.reclaim_log.first().expect("the scenario reclaims the task");
+    assert_eq!(first.id, handle.id());
+    assert_eq!(first.reason, waker_protocol::CheckpointReason::Manual);
+    assert_eq!(sched.tasks.get(handle.id()).unwrap().stats.restore_count, 1);
     Ok(())
 }

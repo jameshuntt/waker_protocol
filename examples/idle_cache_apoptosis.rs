@@ -28,6 +28,7 @@ impl IdleCacheTask {
     }
 }
 
+// SAFETY: the functions only touch `self`, and `restore` panics rather than misreading short bytes.
 unsafe impl ProtocolTask for IdleCacheTask {
     unsafe fn poll(&mut self) -> TaskPoll {
         if self.idle_ticks >= self.idle_before_checkpoint {
@@ -103,8 +104,7 @@ fn main() -> Result<(), String> {
 
     sched.register_vtable(key, &IDLE_CACHE_TASK_VTABLE);
 
-    let mut policy = TaskPolicy::default();
-    policy.qos = QoSClass::Background;
+    let policy = TaskPolicy { qos: QoSClass::Background, ..TaskPolicy::default() };
 
     let handle = sched.spawn_box(
         key,
@@ -130,6 +130,12 @@ fn main() -> Result<(), String> {
     handle.wake(WakeReason::Resume)?;
     sched.run_once()?; // restore + process touch
 
-    println!("reclaim events = {}", sched.reclaim_log.len());
+    for event in &sched.reclaim_log {
+        println!("task {:?} reclaimed {} bytes for {:?}", event.id, event.reclaimed_bytes, event.reason);
+    }
+    let first = sched.reclaim_log.first().expect("the scenario reclaims the task");
+    assert_eq!(first.id, handle.id());
+    assert_eq!(first.reason, waker_protocol::CheckpointReason::Idle);
+    assert_eq!(sched.tasks.get(handle.id()).unwrap().stats.restore_count, 1);
     Ok(())
 }

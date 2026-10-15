@@ -3,16 +3,21 @@ use crossbeam_channel::Sender;
 use std::sync::Arc;
 use std::task::Waker;
 use waker_tables::{
-    declare_raw_waker_vtable, derive_arc_unsafe_wakeable, waker_from_arc,
+    derive_arc_unsafe_wakeable, waker_from_arc,
 };
 
+/// What a scheduler waker carries.
 pub struct TaskWakeSignal {
+    /// The task to wake.
     pub id: TaskId,
+    /// The scheduler's channel.
     pub tx: Sender<SchedulerMsg>,
+    /// The wake reason it sends.
     pub reason: WakeReason,
 }
 
 impl TaskWakeSignal {
+    /// Send the wake.
     pub fn emit(self: Arc<Self>) {
         let _ = self.tx.send(SchedulerMsg::Wake {
             id: self.id,
@@ -22,13 +27,13 @@ impl TaskWakeSignal {
 }
 
 derive_arc_unsafe_wakeable!(TaskWakeSignal, emit);
-declare_raw_waker_vtable!(TaskWakeSignal, TASK_WAKE_SIGNAL_RAW_VTABLE);
 
+/// A `std::task::Waker` that wakes task `id` with `reason`.
 pub fn scheduler_waker(
     id: TaskId,
     tx: Sender<SchedulerMsg>,
     reason: WakeReason,
 ) -> Waker {
     let signal = Arc::new(TaskWakeSignal { id, tx, reason });
-    waker_from_arc(signal, &TASK_WAKE_SIGNAL_RAW_VTABLE)
+    waker_from_arc(signal)
 }

@@ -9,6 +9,7 @@ struct UiTask {
     frames: usize,
 }
 
+// SAFETY: the functions only touch `self`, and `restore` panics rather than misreading short bytes.
 unsafe impl ProtocolTask for UiTask {
     unsafe fn poll(&mut self) -> TaskPoll {
         self.frames += 1;
@@ -35,6 +36,7 @@ struct IndexerTask {
     buffer: Vec<u8>,
 }
 
+// SAFETY: the functions only touch `self`, and `restore` panics rather than misreading short bytes.
 unsafe impl ProtocolTask for IndexerTask {
     unsafe fn poll(&mut self) -> TaskPoll {
         if self.buffer.is_empty() {
@@ -80,12 +82,13 @@ fn main() -> Result<(), String> {
     sched.register_vtable(ui_key, &UI_TASK_VTABLE);
     sched.register_vtable(batch_key, &INDEXER_TASK_VTABLE);
 
-    let mut ui_policy = TaskPolicy::default();
-    ui_policy.qos = QoSClass::Interactive;
+    let ui_policy = TaskPolicy { qos: QoSClass::Interactive, ..TaskPolicy::default() };
 
-    let mut batch_policy = TaskPolicy::default();
-    batch_policy.qos = QoSClass::Background;
-    batch_policy.memory_budget_hint = Some(1024);
+    let batch_policy = TaskPolicy {
+        qos: QoSClass::Background,
+        memory_budget_hint: Some(1024),
+        ..TaskPolicy::default()
+    };
 
     let ui = sched.spawn_box(ui_key, Box::new(UiTask { frames: 0 }), ui_policy)?;
     let batch = sched.spawn_box(
@@ -100,13 +103,14 @@ fn main() -> Result<(), String> {
     batch.wake(WakeReason::MemoryPressure)?;
     sched.run_once()?;
 
-    println!("reclaim events = {}", sched.reclaim_log.len());
-    for event in &sched.reclaim_log {
-        println!(
-            "task {:?} reclaimed {} bytes for {:?}",
-            event.id, event.reclaimed_bytes, event.reason
-        );
-    }
 
+    for event in &sched.reclaim_log {
+        println!("task {:?} reclaimed {} bytes for {:?}", event.id, event.reclaimed_bytes, event.reason);
+    }
+    let first = sched.reclaim_log.first().expect("the scenario reclaims the task");
+    assert_eq!(first.id, batch.id());
+    assert_eq!(first.reason, waker_protocol::CheckpointReason::MemoryPressure);
+    assert_eq!(sched.tasks.get(batch.id()).unwrap().stats.restore_count, 0);
+    assert!(sched.reclaim_log.iter().all(|e| e.id != ui.id()), "the interactive task is never reclaimed");
     Ok(())
 }

@@ -10,6 +10,7 @@ use std::collections::HashMap;
 struct ChaosTask {
     id: u32,
     state: Vec<u64>,
+    #[allow(dead_code)]
     wake_counts: HashMap<WakeReason, usize>,
     is_cancelled: bool,
 }
@@ -32,6 +33,7 @@ struct ChaosTask {
 //         }
 //     }
 // 1. Make the tasks much "heavier" so they actually exceed budgets
+// SAFETY: the functions only touch `self`, and `restore` panics rather than misreading short bytes.
 unsafe impl ProtocolTask for ChaosTask {
     unsafe fn poll(&mut self) -> TaskPoll {
         if self.is_cancelled { return TaskPoll::Ready; }
@@ -91,11 +93,14 @@ fn main() -> Result<(), String> {
 
     
     for i in 0..1000 {
-        let mut policy = TaskPolicy::default();
         // FORCE RECLAMATION: Tell the scheduler this task should only use 1KB.
         // When it hits 5KB in the poll, the scheduler MUST react.
-        policy.memory_budget_hint = Some(1024); 
-        policy.qos = QoSClass::Background; // Background tasks are evicted first  
+        // Background tasks are evicted first.
+        let policy = TaskPolicy {
+            memory_budget_hint: Some(1024),
+            qos: QoSClass::Background,
+            ..TaskPolicy::default()
+        };
         let handle = sched.spawn_box(
             key, 
             Box::new(ChaosTask { 
@@ -184,7 +189,7 @@ fn main() -> Result<(), String> {
     println!("Reclaim Events: {}", sched.reclaim_log.len());
     
     // Verify that the library didn't crash during massive QoS/Memory churn
-    if sched.reclaim_log.len() > 0 {
+    if !sched.reclaim_log.is_empty() {
         let sample = &sched.reclaim_log[0];
         println!("Sample Reclaim: Task {:?} for reason {:?}", sample.id, sample.reason);
     }

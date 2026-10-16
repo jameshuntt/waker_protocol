@@ -345,6 +345,34 @@ fn biased_qos_polls_higher_classes_first() {
     ORDER.with(|o| assert_eq!(*o.borrow(), ["realtime", "standard", "background"]));
 }
 
+/// Within a class, `BiasedQoS` polls the task least recently woken first, and a wake to a task
+/// already runnable counts. Fails if a wake does not set `runnable_seq`, or if the tie-break is
+/// reversed.
+#[test]
+fn biased_qos_polls_the_least_recently_woken_first_within_a_class() {
+    let mut sched = scheduler();
+    sched.config = SchedulerConfig { wake_ordering: WakeOrdering::BiasedQoS };
+    let policy = TaskPolicy { qos: QoSClass::Interactive, ..TaskPolicy::default() };
+    let a = sched.spawn_box(COUNTER, Counter::boxed("a", 100), policy.clone()).unwrap();
+    let b = sched.spawn_box(COUNTER, Counter::boxed("b", 100), policy).unwrap();
+    clear_order();
+    sched.run_once().unwrap();
+    assert_eq!(order(), ["a", "b"], "spawned a, then b");
+
+    clear_order();
+    b.wake(WakeReason::Manual).unwrap();
+    a.wake(WakeReason::Manual).unwrap();
+    sched.run_once().unwrap();
+    assert_eq!(order(), ["b", "a"], "woken b, then a");
+
+    clear_order();
+    a.wake(WakeReason::Manual).unwrap();
+    b.wake(WakeReason::Manual).unwrap();
+    a.wake(WakeReason::Manual).unwrap();
+    sched.run_once().unwrap();
+    assert_eq!(order(), ["b", "a"], "a was runnable first, but its latest wake came after b's");
+}
+
 #[test]
 fn dropping_the_scheduler_frees_live_and_queued_work() {
     let before = drops();
@@ -1775,9 +1803,12 @@ fn the_strategy_is_never_shown_a_task_just_restored() {
 // 0.3.2, third review: a panic in a message's `deliver`, or in a task's `cleanup` or `Drop`, is
 // caught and is an error for the round; the store's `remove` is called only once the task is freed.
 
-/// Where a [`Fragile`] task panics as it is freed: in `cleanup`, in its own drop, or both.
+/// Where a [`Fragile`] task panics as it is freed: in `cleanup`, in its own drop, or both. The
+/// `BOMB_` ones panic there with a [`Bomb`], whose own drop panics, in place of text.
 const IN_CLEANUP: u8 = 1;
 const IN_DROP: u8 = 2;
+const BOMB_IN_CLEANUP: u8 = 8;
+const BOMB_IN_DROP: u8 = 16;
 
 /// Gives the poll `poll` (a [`Scripted`] code: READY, PENDING or CHECKPOINT) every time, and
 /// panics as it is freed where `panic_in` says. Writes "cleanup" and "drop" to ORDER.
@@ -1802,6 +1833,9 @@ impl Drop for Fragile {
     fn drop(&mut self) {
         DROPS.with(|d| d.set(d.get() + 1));
         ORDER.with(|o| o.borrow_mut().push("drop"));
+        if self.panic_in & BOMB_IN_DROP != 0 {
+            panic_any(Bomb);
+        }
         if self.panic_in & IN_DROP != 0 {
             panic!("boom in drop");
         }
@@ -1828,6 +1862,9 @@ unsafe impl ProtocolTask for Fragile {
 
     unsafe fn cleanup(&mut self) {
         ORDER.with(|o| o.borrow_mut().push("cleanup"));
+        if self.panic_in & BOMB_IN_CLEANUP != 0 {
+            panic_any(Bomb);
+        }
         if self.panic_in & IN_CLEANUP != 0 {
             panic!("boom in cleanup");
         }
@@ -1876,9 +1913,20 @@ fn a_panic_in_a_messages_deliver_drops_only_that_message_and_the_round_goes_on()
     assert_eq!(drops() - before, 0, "nothing is freed");
 }
 
+/// With both `cleanup` and `Drop` panicking, the error names `cleanup`'s panic, even when the
+/// drop's payload panics again as it is dropped (a [`Bomb`]). Fails if that payload is dropped
+/// with a plain drop: its panic then replaces `cleanup`'s, or, with `cleanup`'s payload a `Bomb`
+/// too, aborts the process.
 #[test]
 fn a_panic_in_cleanup_or_drop_is_an_error_for_the_round_and_the_round_goes_on() {
-    for panic_in in [IN_CLEANUP, IN_DROP, IN_CLEANUP | IN_DROP] {
+    let cases = [
+        (IN_CLEANUP, "boom in cleanup"),
+        (IN_DROP, "boom in drop"),
+        (IN_CLEANUP | IN_DROP, "boom in cleanup"),
+        (IN_CLEANUP | BOMB_IN_DROP, "boom in cleanup"),
+        (BOMB_IN_CLEANUP | BOMB_IN_DROP, "a panic payload that is not text"),
+    ];
+    for (panic_in, text) in cases {
         for poll in [READY, CHECKPOINT] {
             let case = format!("panic_in {panic_in}, poll {poll}");
             let mut sched = scheduler();
@@ -1888,7 +1936,6 @@ fn a_panic_in_cleanup_or_drop_is_an_error_for_the_round_and_the_round_goes_on() 
             let after = sched.spawn_box(COUNTER, Counter::boxed("after", 100), background).unwrap();
             let round = catch_unwind(AssertUnwindSafe(|| sched.run_once()));
 
-            let text = if panic_in & IN_CLEANUP != 0 { "boom in cleanup" } else { "boom in drop" };
             let expected = format!("task {:?} panicked in cleanup or drop: {text}", h.id());
             assert!(matches!(&round, Ok(Err(err)) if *err == expected), "{case}: {round:?}");
             assert_eq!(row(&sched, after.id()).stats.poll_count, 1, "{case}: the task after it is polled in that round");
@@ -2666,4 +2713,115 @@ fn spawn_interval_waker_wakes_its_task_with_timer_until_the_scheduler_is_gone() 
 
     drop(sched);
     ticker.join().expect("the thread ends once the scheduler is gone");
+}
+
+// ---------------------------------------------------------------------------------------------
+// 0.3.2, eighth review: a wake keeps its poll whatever wakes come after it; the idle rule spares
+// a task with a wake waiting; a task that ends under a retain flag keeps only its latest
+// `keep_latest` checkpoints; a cancelled task is never polled again.
+
+/// A wake other than `QoS` or `MemoryPressure` keeps its poll whatever wakes come after it in
+/// the same round: the strategy's checkpoint leaves the task runnable, and the next round
+/// restores and polls it. Fails if only the newest wake is counted.
+#[test]
+fn a_wake_keeps_its_poll_when_a_qos_or_memory_pressure_wake_follows_it() {
+    let follows: [&[WakeReason]; 3] =
+        [&[WakeReason::QoS], &[WakeReason::MemoryPressure], &[WakeReason::QoS, WakeReason::MemoryPressure]];
+    for after in follows {
+        let mut sched = scheduler();
+        let h = sched.spawn_box(COUNTER, Counter::boxed("b", 100), over_budget()).unwrap();
+        sched.run_once().unwrap(); // checkpointed in place of its first poll
+        sched.run_once().unwrap(); // restored and polled for its spawn
+        h.wake(WakeReason::Manual).unwrap();
+        for reason in after {
+            h.wake(reason.clone()).unwrap();
+        }
+        sched.run_once().unwrap(); // checkpointed in place of the poll for the Manual wake
+        let entry = row(&sched, h.id());
+        assert!(matches!(entry.resident, Resident::Dormant), "{after:?}: the strategy checkpointed it");
+        assert_eq!(entry.state, TaskState::Runnable, "{after:?}: runnable for the Manual wake");
+        assert_eq!(entry.stats.last_wake.as_ref(), after.last(), "{after:?}: on_wake heard every wake");
+
+        sched.run_once().unwrap();
+        let entry = row(&sched, h.id());
+        assert_eq!((entry.stats.restore_count, entry.stats.poll_count), (2, 2), "{after:?}: the next round restored and polled it");
+    }
+}
+
+/// The default idle rule spares a task idle past its threshold that has a wake waiting and no
+/// message. Fails if the rule counts only waiting messages.
+#[test]
+fn the_idle_rule_spares_a_task_with_a_wake_waiting() {
+    let mut sched = scheduler_with(MemoryCheckpointStore::default(), Box::new(eager_default_strategy()));
+    let h = sched.spawn_box(COUNTER, Counter::boxed("i", 100), TaskPolicy::default()).unwrap();
+    sched.run_once().unwrap(); // polled for its spawn; idle from then on, past a threshold of zero
+    h.wake(WakeReason::Timer).unwrap();
+    sched.run_once().unwrap();
+
+    let reasons: Vec<_> = sched.reclaim_log.iter().map(|r| r.reason.clone()).collect();
+    assert!(reasons.is_empty(), "the waiting wake spares it: {reasons:?}");
+    let entry = row(&sched, h.id());
+    assert_eq!((entry.stats.poll_count, entry.stats.restore_count), (2, 0), "polled for the wake in that round");
+}
+
+/// A task that ends under a retain flag keeps only its latest `keep_latest` checkpoints in the
+/// store, even when its history holds more: here an older one the store failed to remove. Fails
+/// if the task's end keeps every checkpoint.
+#[test]
+fn a_task_that_ends_under_a_retain_flag_keeps_only_its_latest_keep_latest_checkpoints() {
+    for keep_latest in [0, 1] {
+        let mut sched = flaky();
+        let retention = RetentionPolicy { keep_latest, retain_on_cancel: true, ..RetentionPolicy::default() };
+        let policy = TaskPolicy { retention, ..TaskPolicy::default() };
+        let h = sched.spawn_box(COUNTER, Counter::boxed("k", 100), policy).unwrap();
+        sched.run_once().unwrap();
+        h.checkpoint(CheckpointReason::Manual).unwrap();
+        sched.run_once().unwrap(); // the first checkpoint
+        h.wake(WakeReason::Manual).unwrap();
+        sched.run_once().unwrap(); // restored and polled
+
+        sched.store.fail_remove(true);
+        h.checkpoint(CheckpointReason::Manual).unwrap();
+        assert_eq!(sched.run_once().unwrap_err(), "remove failed", "keep_latest {keep_latest}: the first one is not pruned");
+        sched.store.fail_remove(false);
+        let ckpts: Vec<_> = sched.reclaim_log.iter().map(|r| r.handle.clone().unwrap()).collect();
+        assert_eq!(row(&sched, h.id()).checkpoint_history, ckpts, "keep_latest {keep_latest}: both are in its history");
+
+        h.cancel().unwrap();
+        sched.run_once().unwrap();
+        assert_eq!(sched.finished, [(h.id(), TaskState::Cancelled)], "keep_latest {keep_latest}");
+        let held: Vec<bool> = ckpts.iter().map(|c| sched.store.holds(c)).collect();
+        let kept = if keep_latest == 0 { [false, false] } else { [false, true] };
+        assert_eq!(held, kept, "keep_latest {keep_latest}: only the latest keep_latest stay in the store");
+    }
+}
+
+/// Cancel ends a task at once, even one with a wake or message waiting (its Spawn wake, or a
+/// message sent before the Cancel): it is removed and freed, never polled again, its messages are
+/// dropped, and a later wake or message does nothing to it. In 0.2.0 Cancel only set the row's
+/// state, and such a wake or message polled the task again.
+#[test]
+fn a_cancelled_task_is_never_polled_again_whatever_wakes_or_messages_come() {
+    for polled_first in [false, true] {
+        let mut sched = scheduler();
+        let before = drops();
+        let h = sched.spawn_box(COUNTER, Counter::boxed("c", 2), TaskPolicy::default()).unwrap();
+        if polled_first {
+            sched.run_once().unwrap();
+        }
+        clear_order();
+
+        h.send("note", "sent before the cancel", note).unwrap();
+        h.cancel().unwrap();
+        h.wake(WakeReason::Manual).unwrap();
+        h.send("note", "sent after the cancel", note).unwrap();
+        sched.run_once().unwrap();
+        h.wake(WakeReason::Manual).unwrap();
+        sched.run_once().unwrap();
+
+        assert!(order().is_empty(), "polled first {polled_first}: never polled again, nothing delivered: {:?}", order());
+        assert!(sched.tasks.get(h.id()).is_none(), "polled first {polled_first}: removed");
+        assert_eq!(sched.finished, [(h.id(), TaskState::Cancelled)], "polled first {polled_first}");
+        assert_eq!(drops() - before, 1, "polled first {polled_first}: freed once");
+    }
 }

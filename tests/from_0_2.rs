@@ -1,5 +1,6 @@
-//! What 0.3.0 removed from 0.2.0 and 0.3.2 puts back, and the differences from 0.2.0 the README
-//! names. Every item put back is used by a test here, so the file does not compile against 0.3.1.
+//! What 0.3.0 removed from 0.2.0 and 0.3.2 puts back, and the differences from 0.2.0 that the
+//! README's 0.3.2 notes say this file checks.
+//! Every item put back is used by a test here, so the file does not compile against 0.3.1.
 //! The Debug test checks the output the README describes (it uses only items public since 0.3.0),
 //! the waker test that `TASK_WAKE_SIGNAL_RAW_VTABLE` is a copy the crate's wakers do not carry,
 //! the empty-pointer test that a `ProtocolTaskPtr` with a null `data` owns nothing, and the
@@ -308,13 +309,28 @@ thread_local! {
     static RAN: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Has inherent `cleanup` and `footprint_estimate` methods named like the trait's, as a 0.2.0
-/// task could, whose 0.2.0 vtable called them in place of the trait's.
+/// Has inherent `poll`, `on_wake`, `checkpoint`, `cleanup` and `footprint_estimate` methods named
+/// like the trait's, with the trait's receivers, as a 0.2.0 task could; its 0.2.0 vtable called
+/// them in place of the trait's.
 struct Shadowed {
     big: Vec<u8>,
 }
 
 impl Shadowed {
+    fn poll(&mut self) -> TaskPoll {
+        RAN.with(|r| r.borrow_mut().push("inherent poll"));
+        TaskPoll::Ready
+    }
+
+    fn on_wake(&mut self, _: WakeReason) {
+        RAN.with(|r| r.borrow_mut().push("inherent on_wake"));
+    }
+
+    fn checkpoint(&mut self) -> Vec<u8> {
+        RAN.with(|r| r.borrow_mut().push("inherent checkpoint"));
+        vec![1]
+    }
+
     fn cleanup(&mut self) {
         RAN.with(|r| r.borrow_mut().push("inherent cleanup"));
     }
@@ -327,10 +343,16 @@ impl Shadowed {
 // SAFETY: the functions only touch `self`.
 unsafe impl ProtocolTask for Shadowed {
     unsafe fn poll(&mut self) -> TaskPoll {
+        RAN.with(|r| r.borrow_mut().push("trait poll"));
         TaskPoll::Pending
     }
 
+    unsafe fn on_wake(&mut self, _: WakeReason) {
+        RAN.with(|r| r.borrow_mut().push("trait on_wake"));
+    }
+
     unsafe fn checkpoint(&mut self) -> Vec<u8> {
+        RAN.with(|r| r.borrow_mut().push("trait checkpoint"));
         Vec::new()
     }
 
@@ -351,15 +373,29 @@ derive_protocol_task_vtable!(Shadowed, SHADOWED_VTABLE);
 
 #[test]
 fn derive_protocol_task_vtable_calls_the_trait_functions_not_inherent_methods_of_the_same_name() {
+    let ran = || RAN.with(|r| r.borrow_mut().drain(..).collect::<Vec<_>>());
     let mut direct = Shadowed { big: vec![0; 100] };
+    assert_eq!(direct.poll(), TaskPoll::Ready);
+    direct.on_wake(WakeReason::Manual);
+    assert_eq!(direct.checkpoint(), [1]);
     direct.cleanup();
     assert_eq!(direct.footprint_estimate(), 100, "method syntax on the type reaches the inherent methods");
-    RAN.with(|r| r.borrow_mut().clear());
+    assert_eq!(ran(), ["inherent poll", "inherent on_wake", "inherent checkpoint", "inherent cleanup"]);
 
-    let task = ProtocolTaskPtr::from_box(Box::new(direct), &SHADOWED_VTABLE);
+    let mut task = ProtocolTaskPtr::from_box(Box::new(direct), &SHADOWED_VTABLE);
+    // SAFETY: `task` owns a live `Shadowed`, and `&mut` gives exclusive access.
+    unsafe {
+        assert_eq!(task.poll(), TaskPoll::Pending);
+        task.on_wake(WakeReason::Manual);
+        assert_eq!(task.checkpoint(), Vec::<u8>::new());
+    }
     assert_eq!(task.footprint_estimate(), 7, "the vtable calls the trait's footprint_estimate");
     drop(task);
-    assert_eq!(RAN.with(|r| r.borrow().clone()), ["trait cleanup"], "and the trait's cleanup");
+    assert_eq!(
+        ran(),
+        ["trait poll", "trait on_wake", "trait checkpoint", "trait cleanup"],
+        "and the trait's poll, on_wake, checkpoint and cleanup"
+    );
 }
 
 /// Holds a task the way 0.2.0 code could: in a field, emptied by moving the task out.

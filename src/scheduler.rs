@@ -82,7 +82,10 @@ pub struct TaskEntry<H> {
     /// prune tries it again.
     pub checkpoint_history: VecDeque<H>,
 
-    /// When it last became runnable; breaks ties in the poll order.
+    /// When it was last woken; breaks ties in the poll order, lowest first. It is set at spawn,
+    /// by each wake or message sent to the task, even one that finds it runnable already (but not
+    /// one kept with the task dormant, `auto_restore_on_wake` off), and when a `Yield` or a
+    /// checkpoint keeps the task runnable for a poll it is owed.
     pub runnable_seq: u64,
 }
 
@@ -457,7 +460,9 @@ impl<T: ProtocolTask> TaskHandle<T> {
 pub struct WakerProtocol<S: CheckpointStore> {
     /// Task vtables by key.
     pub registry: ProtocolVTableRegistry,
-    /// The tasks.
+    /// The tasks. A row taken out of it directly (`tasks.remove(id)`, to move the task to another
+    /// scheduler, say) is not recorded in [`finished`](Self::finished), and a poll the task was
+    /// owed is forgotten at the start of the scheduler's next round.
     pub tasks: TaskSlab<TaskEntry<S::Handle>>,
     /// Every reclaim so far.
     pub reclaim_log: Vec<ReclaimReport<S::Handle>>,
@@ -478,7 +483,8 @@ pub struct WakerProtocol<S: CheckpointStore> {
     restored: HashSet<TaskId>,
     /// Tasks owed a poll: each was handed work (a message, or a wake other than `QoS` or
     /// `MemoryPressure`) it has not been polled for since, or yielded with
-    /// `eager_repoll_after_yield`. A task leaves the set only when its poll runs or it ends, so a
+    /// `eager_repoll_after_yield`. A task leaves the set only when its poll runs, when it ends,
+    /// or when a round starts after its row was taken out of `tasks` (`forget_gone_rows`), so a
     /// checkpoint (the strategy's, or one a Checkpoint or Capitulate message asks for) keeps it
     /// runnable, even after a `QoS` or `MemoryPressure` wake, a save of an earlier checkpoint that
     /// failed, or a strategy that panicked.
@@ -612,7 +618,7 @@ impl<S: CheckpointStore> WakerProtocol<S> {
     /// channel, and no task is restored or polled.
     pub fn run_once(&mut self) -> Result<(), String> {
         let mut errors = Errors::default();
-        self.round(&mut errors);
+        self.round(None, &mut errors);
         errors.finish()
     }
 
@@ -641,10 +647,8 @@ impl<S: CheckpointStore> WakerProtocol<S> {
 
         let mut errors = Errors::default();
         // The scheduler holds a sender itself, so this ends with a message or the timeout.
-        if let Ok(msg) = self.rx.recv_timeout(timeout) {
-            self.process_msg(msg, &mut errors);
-        }
-        self.round(&mut errors);
+        let first = self.rx.recv_timeout(timeout).ok();
+        self.round(first, &mut errors);
         errors.finish().map(|()| !self.shutdown)
     }
 
@@ -654,12 +658,27 @@ impl<S: CheckpointStore> WakerProtocol<S> {
         out
     }
 
-    /// Every queued message, then every runnable task once; after Shutdown, nothing.
-    fn round(&mut self, errors: &mut Errors) {
+    /// Forget the rows that are gone, then handle `first` (the message `pump` waited for) and
+    /// every queued message, then poll every runnable task once; after Shutdown, nothing more.
+    fn round(&mut self, first: Option<SchedulerMsg>, errors: &mut Errors) {
+        self.forget_gone_rows();
+        if let Some(msg) = first {
+            self.process_msg(msg, errors);
+        }
         self.drain_inbox(errors);
         if !self.shutdown {
             self.poll_ready(errors);
         }
+    }
+
+    /// Drop from `restored` and `owed` every id whose row is gone: taken out through the public
+    /// `tasks` field, which never passes through `finish`. Ids never come back (the slab moves a
+    /// slot to its next generation, or retires it), so nothing else would ever remove them, and
+    /// each round starts here, before it looks an id up in either set.
+    fn forget_gone_rows(&mut self) {
+        let tasks = &self.tasks;
+        self.restored.retain(|id| tasks.get(*id).is_some());
+        self.owed.retain(|id| tasks.get(*id).is_some());
     }
 
     /// Handle queued messages up to and including a Shutdown; what comes after it stays queued.
@@ -1048,5 +1067,62 @@ impl<S: CheckpointStore> WakerProtocol<S> {
             errors.note(removed);
         }
         errors.finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::MemoryCheckpointStore;
+
+    /// Yields on every poll, so it is always owed its next poll.
+    struct Yields;
+
+    // SAFETY: the functions touch nothing.
+    unsafe impl ProtocolTask for Yields {
+        unsafe fn poll(&mut self) -> TaskPoll {
+            TaskPoll::Yield
+        }
+
+        unsafe fn checkpoint(&mut self) -> Vec<u8> {
+            Vec::new()
+        }
+
+        unsafe fn restore(_: &[u8]) -> Self {
+            Self
+        }
+    }
+
+    static YIELDS: ProtocolVTable = ProtocolVTable::of::<Yields>();
+    const KEY: VTableKey = VTableKey { segment: "test", kind: "yields", version: 1 };
+
+    /// A row taken out through the public `tasks` field while its task is owed a poll, live or
+    /// dormant after a checkpoint, leaves no id in the scheduler's private sets once the next round
+    /// starts. Fails if such ids are kept: `owed` then grows by one for every row taken out.
+    #[test]
+    fn a_row_taken_out_through_tasks_leaves_no_id_behind() {
+        let mut sched = WakerProtocol::new(MemoryCheckpointStore::default());
+        sched.register_vtable(KEY, &YIELDS);
+        for checkpointed in [false, true] {
+            for _ in 0..20 {
+                // Without auto-restore, a task checkpointed while owed a poll stays dormant.
+                let policy = TaskPolicy { auto_restore_on_wake: !checkpointed, ..TaskPolicy::default() };
+                let task = sched.spawn_box(KEY, Box::new(Yields), policy).unwrap();
+                sched.run_once().unwrap(); // polled: it yields, and is owed its next poll
+                if checkpointed {
+                    task.checkpoint(CheckpointReason::Manual).unwrap();
+                    sched.run_once().unwrap(); // dormant, and still owed that poll
+                    assert!(matches!(sched.tasks.get(task.id()).unwrap().resident, Resident::Dormant));
+                }
+                assert!(sched.owed.contains(&task.id()), "checkpointed {checkpointed}: owed a poll");
+
+                drop(sched.tasks.remove(task.id()).expect("the row is there"));
+                task.cancel().unwrap(); // a message for the id finds no row
+                sched.run_once().unwrap();
+                assert!(sched.owed.is_empty(), "checkpointed {checkpointed}: {:?} is forgotten", task.id());
+                assert!(sched.restored.is_empty(), "checkpointed {checkpointed}");
+            }
+        }
+        assert!(sched.finished.is_empty(), "a row taken out is not recorded in `finished`");
     }
 }

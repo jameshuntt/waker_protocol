@@ -33,7 +33,10 @@ impl QoSClass {
 pub enum WakeOrdering {
     /// Round robin, ignoring priority.
     UnbiasedRoundRobin,
-    /// Highest priority first, then longest runnable.
+    /// Highest priority first, then least recently woken: within a class, the task with the
+    /// lowest [`TaskEntry::runnable_seq`](crate::TaskEntry::runnable_seq) first. A wake to a task
+    /// already runnable sets it again, so that task waits behind tasks woken before that wake,
+    /// even ones that became runnable after it.
     BiasedQoS,
     /// Highest priority first, then least recently polled (the default).
     BiasedQoSThenAge,

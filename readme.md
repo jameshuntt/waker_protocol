@@ -174,6 +174,10 @@ back. No public signature changed. New public items: the field
 - **Strategy docs.** `CapitulateStrategy` is asked before a poll, but not before the first poll
   after a restore, and `TaskSnapshot::pending_wakes` never counts a restore's `Resume`; the docs
   said "before each poll" and "a restore adds `Resume`".
+- **`BiasedQoS` docs.** Within a class, `BiasedQoS` polls the task least recently woken first: a
+  wake to a task already runnable counts, so that task waits behind tasks woken before that wake,
+  even ones that became runnable after it. The tie-break is the one 0.3.1 had; its docs said
+  "longest runnable".
 - **Put back from 0.2.0.** 0.3.0 removed these. Its notes said the fields of `ProtocolVTable`
   and `ProtocolTaskPtr` became private, but not that reading them or building from parts went
   with the fields, and they did not mention `TASK_WAKE_SIGNAL_RAW_VTABLE` or `raw_data` at all.
@@ -233,17 +237,34 @@ back. No public signature changed. New public items: the field
   lookup found it first: for `poll`, `on_wake`, `checkpoint` and `footprint_estimate`, one with
   the same receiver as the trait's (`&mut self`, or `&self` for `footprint_estimate`); for
   `cleanup`, which it called on the task's `Box`, one whose receiver is `self`, `&self`,
-  `&mut self` or `self: Box<Self>` (not an `Rc`, `Arc` or `Pin` receiver). Such a method no longer
-  runs from the scheduler, with no error: move its body into the `ProtocolTask` impl. This
-  changed in 0.3.0 and stays, because the vtable runs exactly the functions the type's
-  `ProtocolTask` impl declares.
+  `&mut self`, `self: Box<Self>`, `self: &Box<Self>` or `self: &mut Box<Self>` (not an `Rc`,
+  `Arc` or `Pin` receiver). Such a method no longer runs from the scheduler, with no error: move
+  its body into the `ProtocolTask` impl. This changed in 0.3.0 and stays, because the vtable runs
+  exactly the functions the type's `ProtocolTask` impl declares.
 - **Tests.** A test for each fix above, each run against the code before the fix first, where it
   fails: 0.3.1's code, or the draft's for a fix to the draft. A fix to the docs alone has its test
   in `tests/doc_claims.rs`, which checks that the old sentence is gone and the new one is there.
-  `tests/from_0_2.rs` uses every item put back from 0.2.0, so it does not compile against 0.3.1,
-  and checks each difference from 0.2.0 this section names. The test for a handle that stays
-  stuck passed before too, because that code was right; it fails on a prune that keeps retrying
-  the stuck handle, which the earlier test did not catch.
+  `tests/from_0_2.rs` uses every item put back from 0.2.0, so it does not compile against 0.3.1.
+  It checks these differences from 0.2.0, which a running program shows: the raw waker vtable
+  static is a copy the crate's wakers do not carry, an empty pointer's `footprint_estimate` is 0,
+  the Debug output names the full path, and the derive's vtable calls the trait's `poll`,
+  `on_wake`, `checkpoint`, `cleanup` and `footprint_estimate`, not inherent methods of the same
+  name. The `compile_fail` doctests in `src/task.rs` check these, which only the compiler shows:
+  safe code cannot build a `ProtocolVTable` or a `ProtocolTaskPtr` from its parts, and
+  `type_name()` cannot be read in a `static`. That a destroy function written as
+  0.2.0's macro wrote it still aborts when `cleanup` and `Drop` both panic is not tested, because
+  an abort ends the test process. The test for a handle that stays stuck passed before too,
+  because that code was right; it fails on a prune that keeps retrying the stuck handle, which
+  the earlier test did not catch. Tests were added, too, for guarantees the code already kept
+  where a review found that no test would fail if they broke, each checked to fail against the
+  code broken to drop its guarantee: the error names `cleanup`'s panic when `cleanup` and `Drop`
+  both panic and the drop's payload panics again as it is dropped; a wake other than `QoS` or
+  `MemoryPressure` keeps its poll when such a wake follows it; the idle rule spares a task with a
+  wake waiting; `BiasedQoS` polls the task least recently woken first within a class; and a task
+  that ends under a retain flag keeps only its latest `keep_latest` checkpoints. A unit test in
+  `src/scheduler.rs` checks that a row taken out through the public `tasks` field leaves no id
+  in the scheduler's private sets once its next round starts; the draft kept such an id for good
+  when the task was owed a poll.
 
 ## 0.3.1
 
@@ -307,8 +328,11 @@ Fixes from a review of 0.3.0. No public signature changed; the behaviour changes
 - `Envelope` is an `unsafe trait` with `target_type`; `dispatch` is `unsafe`. In 0.2 `dispatch` was
   a safe method on a raw pointer, and a message for another task type was delivered anyway.
 - `ProtocolTaskPtr`'s fields are private; `restore_from_bytes` and `footprint_estimate` are safe.
-- Cancelling a task removes it and frees it; in 0.2 it stayed in memory until the scheduler was
-  dropped.
+- Cancelling a task removes it and frees it at once: its queued messages are dropped, its
+  checkpoints are removed unless `retain_on_cancel` keeps the latest `keep_latest`, a later wake
+  does nothing, and a later message is dropped. In 0.2 Cancel only set the row's state to
+  `Cancelled`, and neither removed nor freed the task: a wake or message already queued for it,
+  or sent later, polled it again as if it had not been cancelled, so it could run on and finish.
 - `WakerProtocol::sender()` gives the scheduler's channel, for `scheduler_waker`.
 
 ## Version note

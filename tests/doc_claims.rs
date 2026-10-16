@@ -299,7 +299,7 @@ fn the_docs_say_the_task_pointer_can_be_read_through_a_shared_reference() {
 #[test]
 fn the_readme_says_the_derive_calls_the_trait_functions() {
     tells(README, "**`derive_protocol_task_vtable!` calls the `ProtocolTask` functions.**");
-    tells(README, "Such a method no longer\n  runs from the scheduler, with no error");
+    tells(README, "Such a method no longer runs from the scheduler, with no error");
 }
 
 // The fifth review of the 0.3.2 draft.
@@ -371,15 +371,15 @@ fn the_debug_note_says_the_check_compares_type_id_and_a_hand_written_vtable_had_
 /// receiver, and the inherent `cleanup` with `self`, `&self`, `&mut self` and `self: Box<Self>`.
 /// A probe of the crates.io 0.2.0 derive itself, on types with an inherent `cleanup` of each
 /// receiver, ran the inherent one for those four and the trait's for `Rc<Self>`, `Arc<Self>` and
-/// `Pin<&mut Self>`.
+/// `Pin<&mut Self>`. The eighth review found two receivers missing: a later probe of that derive
+/// ran an inherent `cleanup(self: &Box<Self>)` and `cleanup(self: &mut Box<Self>)` in place of the
+/// trait's, as method lookup on a `Box<T>` tries `Box<T>`, `&Box<T>` and `&mut Box<T>` before `T`.
 #[test]
 fn the_derive_note_says_which_inherent_methods_ran_in_0_2_0() {
     assert!(!README.contains("one with any receiver"), "still says an inherent `cleanup` with any receiver ran");
-    says(
-        README,
-        "so an inherent method of the same name, when the type had one, ran in\n  place of the trait's.",
-        "for `poll`, `on_wake`, `checkpoint` and `footprint_estimate`, one with\n  the same receiver as the trait's (`&mut self`, or `&self` for `footprint_estimate`); for\n  `cleanup`, which it called on the task's `Box`, one whose receiver is `self`, `&self`,\n  `&mut self` or `self: Box<Self>` (not an `Rc`, `Arc` or `Pin` receiver).",
-    );
+    let all = "for `poll`, `on_wake`, `checkpoint` and `footprint_estimate`, one with\n  the same receiver as the trait's (`&mut self`, or `&self` for `footprint_estimate`); for\n  `cleanup`, which it called on the task's `Box`, one whose receiver is `self`, `&self`,\n  `&mut self`, `self: Box<Self>`, `self: &Box<Self>` or `self: &mut Box<Self>` (not an `Rc`,\n  `Arc` or `Pin` receiver).";
+    says(README, "so an inherent method of the same name, when the type had one, ran in\n  place of the trait's.", all);
+    says(README, "`&mut self` or `self: Box<Self>` (not an `Rc`", all);
 }
 
 /// Proved by `from_box_drops_a_task_it_refuses_before_it_panics`.
@@ -510,4 +510,55 @@ fn the_safety_notes_say_the_rows_vtable_decides_what_a_checkpoint_is_restored_as
 fn the_manifest_requires_the_waker_tables_that_has_raw_waker_vtable() {
     says(CARGO_TOML, "waker_tables = \"0.3\"\n", "waker_tables = \"0.3.1\"\n");
     tells(README, "`raw_waker_vtable()`, which waker_tables has had since 0.3.1; this release requires\n    waker_tables 0.3.1 or later.");
+}
+
+// The eighth review of the 0.3.2 draft.
+
+/// Proved by `biased_qos_polls_the_least_recently_woken_first_within_a_class`, which fails when a
+/// wake does not set `runnable_seq` and when the tie-break is reversed.
+#[test]
+fn the_biased_qos_docs_say_least_recently_woken_first() {
+    says(POLICY, "then longest runnable", "Highest priority first, then least recently woken: within a class, the task with the\n    /// lowest");
+    tells(POLICY, "A wake to a task\n    /// already runnable sets it again");
+    says(SCHEDULER, "When it last became runnable", "/// When it was last woken; breaks ties in the poll order, lowest first.");
+    tells(README, "**`BiasedQoS` docs.** Within a class, `BiasedQoS` polls the task least recently woken first");
+}
+
+/// Proved by tests/from_0_2.rs, whose derive test now gives `Shadowed` inherent `poll`, `on_wake`
+/// and `checkpoint` as well (it fails against a derive that calls them with method syntax, as
+/// 0.2.0's did), and by the `compile_fail` doctests in src/task.rs.
+#[test]
+fn the_tests_note_says_where_each_difference_from_0_2_0_is_checked() {
+    says(README, "checks each difference from 0.2.0 this section names", "It checks these differences from 0.2.0, which a running program shows:");
+    tells(README, "The `compile_fail` doctests in `src/task.rs` check these, which only the compiler shows:");
+    tells(README, "is not tested, because\n  an abort ends the test process.");
+    says(
+        FROM_0_2,
+        "and the differences from 0.2.0 the README\n//! names.",
+        "and the differences from 0.2.0 that the\n//! README's 0.3.2 notes say this file checks.",
+    );
+}
+
+/// Proved by `a_cancelled_task_is_never_polled_again_whatever_wakes_or_messages_come`; what 0.2.0
+/// did, by its source: its Cancel only sets `entry.state = TaskState::Cancelled`, and its
+/// `is_runnable` is true for any queued wake or message.
+#[test]
+fn the_0_3_0_note_says_what_cancel_did_in_0_2() {
+    says(
+        README,
+        "frees it; in 0.2 it stayed in memory",
+        "In 0.2 Cancel only set the row's state to\n  `Cancelled`, and neither removed nor freed the task",
+    );
+    tells(README, "a later wake\n  does nothing, and a later message is dropped.");
+}
+
+/// Proved by `scheduler::tests::a_row_taken_out_through_tasks_leaves_no_id_behind`, which fails
+/// when the round does not drop the ids of rows that are gone; and, for the tests note, by the
+/// five tests it names, each run against the mutant the review gave.
+#[test]
+fn the_docs_say_a_row_taken_out_leaves_nothing_owed_and_name_the_new_tests() {
+    tells(SCHEDULER, "A row taken out of it directly (`tasks.remove(id)`, to move the task to another\n    /// scheduler, say) is not recorded in");
+    tells(SCHEDULER, "or when a round starts after its row was taken out of `tasks` (`forget_gone_rows`)");
+    tells(README, "A unit test in\n  `src/scheduler.rs` checks that a row taken out through the public `tasks` field leaves no id");
+    tells(README, "Tests were added, too, for guarantees the code already kept");
 }

@@ -1,0 +1,11 @@
+[package]
+name = "flaws_0_2_0"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+waker_protocol = "=0.2.0"
+waker_tables = "=0.1.4"
+
+[workspace]

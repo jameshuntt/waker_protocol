@@ -1,0 +1,11 @@
+[package]
+name = "ub"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+waker_protocol = "=0.3.0"
+waker_tables = "=0.3.0"
+
+[workspace]

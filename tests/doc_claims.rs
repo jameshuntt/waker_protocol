@@ -97,14 +97,15 @@ fn readme_does_not_claim_heav_task_asserts_anything() {
 
 /// Proved by `a_panic_whose_payload_panics_when_dropped_still_ends_the_task_as_failed`,
 /// `a_panic_in_restore_ends_the_task_as_failed_and_the_round_goes_on` and the two
-/// `a_panic_in_footprint_estimate_...` tests.
+/// `a_panic_in_footprint_estimate_...` tests, and (for `wake_at`, 0.4.0)
+/// `tests/time_kit.rs`'s `a_panic_in_wake_at_ends_the_task_as_failed`.
 #[test]
 fn every_task_function_the_scheduler_catches_is_named() {
     let old = "`poll`, `on_wake` or `checkpoint`";
-    says(TASK, old, "If `poll`, `on_wake`, `checkpoint`, `restore` or `footprint_estimate` panics, the");
+    says(TASK, old, "If `poll`, `on_wake`, `checkpoint`, `restore`, `footprint_estimate` or `wake_at` panics, the");
     says(TASK, old, "even one whose own drop panics");
-    says(SCHEDULER, old, "`poll`, `on_wake`, `checkpoint`, `restore` or `footprint_estimate`");
-    says(TYPES, "`on_wake`\n    /// or `checkpoint`.", "`poll`, `on_wake`, `checkpoint`, `restore` or `footprint_estimate`.");
+    says(SCHEDULER, old, "`poll`, `on_wake`, `checkpoint`, `restore`, `footprint_estimate` or `wake_at`");
+    says(TYPES, "`on_wake`\n    /// or `checkpoint`.", "`poll`, `on_wake`, `checkpoint`, `restore`, `footprint_estimate` or `wake_at`.");
 }
 
 /// Proved by `a_panic_from_the_stores_load_or_remove_reaches_the_caller_and_leaves_the_task_as_the_docs_say`

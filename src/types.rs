@@ -99,7 +99,7 @@ pub enum TaskState {
     /// Cancelled.
     Cancelled,
     /// Failed with an error, or with a message naming a panic in the task's own
-    /// `poll`, `on_wake`, `checkpoint`, `restore` or `footprint_estimate`.
+    /// `poll`, `on_wake`, `checkpoint`, `restore`, `footprint_estimate` or `wake_at`.
     Failed(String),
 }
 

@@ -98,8 +98,20 @@ pub struct TaskPolicy {
     /// answered by the checkpoint, with no poll: the task stays dormant until another wake or
     /// message.
     pub memory_budget_hint: Option<usize>,
-    /// Reserved: the scheduler does not read it yet.
+    /// How long the task may wait with no work before it is parked: once it has gone this long
+    /// without a poll (counted from its spawn until its first), with no message, no wake and no
+    /// poll owed, the scheduler checkpoints it ([`CheckpointReason::Idle`](crate::CheckpointReason::Idle))
+    /// and it is dormant until a wake or message restores it (with `auto_restore_on_wake`; with it
+    /// off, as for any dormant task). Its interval and its `wake_at` moment still wake it. A task
+    /// whose vtable gives no checkpoint ([`ProtocolVTable::live`](crate::ProtocolVTable::live)) is
+    /// never parked. `None` (the default) parks nothing.
     pub dormancy_ttl: Option<Duration>,
+    /// Wake the task with [`WakeReason::Timer`](crate::WakeReason::Timer) every `interval`, from its
+    /// spawn, dormant or not; the scheduler keeps the time itself, with no thread. The ticks are at
+    /// a fixed rate: one round that comes late wakes the task once, and the next tick is the next
+    /// multiple of `interval` after it. `pump` waits no longer than the next tick. `None` (the
+    /// default) sets no interval; a zero interval is taken as none.
+    pub interval: Option<Duration>,
 }
 
 impl Default for TaskPolicy {
@@ -111,6 +123,7 @@ impl Default for TaskPolicy {
             retention: RetentionPolicy::default(),
             memory_budget_hint: None,
             dormancy_ttl: None,
+            interval: None,
         }
     }
 }

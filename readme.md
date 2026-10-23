@@ -15,7 +15,7 @@ scheduler keeps a reclaim log of every such event.
 | `scheduler` | `WakerProtocol`, `SchedulerHandle`, `TaskHandle`, the resident task table |
 | `policy` | `QoSClass`, `WakeOrdering`, `RetentionPolicy`, `TaskPolicy`, `SchedulerConfig` |
 | `capitulate` | `CapitulateStrategy`, `CapitulatePlan`, `TaskSnapshot`, `ReclaimReport` |
-| `checkpoint` | `CheckpointStore`, `CheckpointHandle`, an in-memory store |
+| `checkpoint` | `Checkpoint` (the state a task gives), `CheckpointStore`, `CheckpointHandle`, an in-memory store |
 | `envelope` | `Envelope`, `TypedEnvelope` for typed task messages |
 | `types` | `TaskId`, `WakeReason`, `CheckpointReason`, `TaskPoll`, `TaskState`, `TaskStats`, `SchedulerMsg` |
 | `slab`, `task`, `wake_ref` | the slab, the protocol vtable and task pointer, the wake signal |
@@ -58,6 +58,29 @@ the type the task was restored as.
 
 `ProtocolTask` is an `unsafe trait`: its functions are called with exclusive access to a live task
 and nothing more, and `restore` must accept any bytes the checkpoint store returns.
+
+## 0.4.0
+
+Three things the kit's time kit found missing, each added beside what 0.3 has; every 0.3 item is
+still there (CHANGELOG.md has the links and the tests).
+
+- **A task declares its own time.** `TaskPolicy::interval` wakes the task with `WakeReason::Timer`
+  every interval from its spawn, at a fixed rate, and `ProtocolTask::wake_at` (asked after every
+  poll) wakes it once at the moment it gives. The scheduler keeps both itself, with no thread
+  (`spawn_interval_waker` is still there), and `pump` waits no longer than the next one.
+- **`TaskPolicy::dormancy_ttl` is honoured.** A task that has gone that long without a poll, with
+  no work waiting, is checkpointed (`CheckpointReason::Idle`) and dormant; a wake, a message, its
+  interval or its `wake_at` moment restores it.
+- **A checkpoint is one the task gives.** A task gives its state by implementing `Checkpoint`
+  (`save`, and a `restore` that may refuse the bytes) under `ProtocolVTable::checkpointed`. A task
+  whose state is live gives none, under `ProtocolVTable::live`, and writes only `poll`: the
+  scheduler never checkpoints it, and a Checkpoint asked of it leaves it live and is returned as an
+  error. `ProtocolVTable::of` keeps the 0.3 form, the task's own `checkpoint` and `restore`; both
+  now have bodies that panic, naming the type, so a task that wrote neither ends as `Failed`
+  rather than being saved as nothing.
+
+`TaskPolicy` has one new field, `interval`; a literal that names every field needs
+`..TaskPolicy::default()`.
 
 ## 0.3.2
 

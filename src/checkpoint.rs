@@ -80,3 +80,55 @@ impl CheckpointStore for MemoryCheckpointStore {
         Ok(())
     }
 }
+/// A task's state as bytes, given by the task itself: the checkpoint a task opts into.
+///
+/// Build the task's vtable with [`ProtocolVTable::checkpointed`](crate::ProtocolVTable::checkpointed)
+/// and the scheduler saves the task with [`save`](Checkpoint::save) and brings it back with
+/// [`restore`](Checkpoint::restore). A task whose state is live (a closure, a socket, a lock it
+/// holds) does not implement this: its vtable comes from
+/// [`ProtocolVTable::live`](crate::ProtocolVTable::live), and the scheduler never checkpoints it
+/// (see [`ProtocolVTable::gives_checkpoint`](crate::ProtocolVTable::gives_checkpoint)).
+///
+/// ```
+/// use waker_protocol::{Checkpoint, MemoryCheckpointStore, ProtocolTask, ProtocolVTable, TaskPoll, WakerProtocol};
+/// use waker_tables::VTableKey;
+///
+/// struct Counter(u64);
+///
+/// impl Checkpoint for Counter {
+///     fn save(&self) -> Vec<u8> {
+///         self.0.to_le_bytes().to_vec()
+///     }
+///     fn restore(bytes: &[u8]) -> Result<Self, String> {
+///         let bytes: [u8; 8] = bytes.try_into().map_err(|_| format!("{} bytes, not 8", bytes.len()))?;
+///         Ok(Counter(u64::from_le_bytes(bytes)))
+///     }
+/// }
+///
+/// // SAFETY: `poll` only touches `self`.
+/// unsafe impl ProtocolTask for Counter {
+///     unsafe fn poll(&mut self) -> TaskPoll {
+///         self.0 += 1;
+///         TaskPoll::Pending
+///     }
+/// }
+///
+/// static COUNTER: ProtocolVTable = ProtocolVTable::checkpointed::<Counter>();
+/// assert!(COUNTER.gives_checkpoint());
+/// let mut sched = WakerProtocol::new(MemoryCheckpointStore::default());
+/// let key = VTableKey { segment: "doc", kind: "counter", version: 1 };
+/// sched.register_vtable(key, &COUNTER);
+/// sched.spawn_box(key, Box::new(Counter(41)), Default::default())?;
+/// sched.run_once()?;
+/// # Ok::<(), String>(())
+/// ```
+pub trait Checkpoint: Sized {
+    /// The task's state as bytes.
+    fn save(&self) -> Vec<u8>;
+
+    /// The task rebuilt from bytes `save` wrote. `bytes` come from the
+    /// [`CheckpointStore`], so they can be anything: an `Err` says why they are refused, and the
+    /// task then ends as [`TaskState::Failed`](crate::TaskState::Failed) with a message that
+    /// carries it.
+    fn restore(bytes: &[u8]) -> Result<Self, String>;
+}

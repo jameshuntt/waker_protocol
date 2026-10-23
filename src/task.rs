@@ -1,9 +1,10 @@
 use crate::unwind::{catch, drop_payload};
-use crate::{TaskPoll, WakeReason};
+use crate::{Checkpoint, TaskPoll, WakeReason};
 use std::any::TypeId;
 use std::fmt;
 use std::mem::ManuallyDrop;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+use std::time::Instant;
 
 /// A task the scheduler drives through a [`ProtocolVTable`].
 ///
@@ -14,7 +15,7 @@ use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 /// which may not be bytes this type wrote; it must not cause undefined behavior for any input
 /// (panicking is fine).
 ///
-/// If `poll`, `on_wake`, `checkpoint`, `restore` or `footprint_estimate` panics, the scheduler
+/// If `poll`, `on_wake`, `checkpoint`, `restore`, `footprint_estimate` or `wake_at` panics, the scheduler
 /// catches it and the task ends as [`TaskState::Failed`](crate::TaskState::Failed), with a
 /// message naming the panic. That holds for any panic payload, even one whose own drop panics.
 ///
@@ -45,19 +46,30 @@ pub unsafe trait ProtocolTask: Send + Sync + 'static {
     /// As `poll`.
     unsafe fn on_wake(&mut self, _reason: WakeReason) {}
 
-    /// The task's state as bytes, for [`ProtocolTask::restore`].
+    /// The task's state as bytes, for [`ProtocolTask::restore`]. Only a vtable from
+    /// [`ProtocolVTable::of`] calls it. A task that gives its state through [`Checkpoint`]
+    /// (vtable [`ProtocolVTable::checkpointed`]), or gives none (vtable [`ProtocolVTable::live`]),
+    /// does not write it; written by neither, it panics, naming the task type, and the task ends
+    /// as Failed: the scheduler never saves bytes the task did not give.
     ///
     /// # Safety
     /// As `poll`.
-    unsafe fn checkpoint(&mut self) -> Vec<u8>;
+    unsafe fn checkpoint(&mut self) -> Vec<u8> {
+        panic!("{} gives no checkpoint: build its vtable with ProtocolVTable::checkpointed or ProtocolVTable::live", std::any::type_name::<Self>())
+    }
 
-    /// Rebuild the task from checkpoint bytes.
+    /// Rebuild the task from checkpoint bytes. Only a vtable from [`ProtocolVTable::of`] calls it;
+    /// as [`checkpoint`](ProtocolTask::checkpoint), it panics when not written.
     ///
     /// # Safety
     /// As the trait's contract states: `bytes` can be anything.
     unsafe fn restore(bytes: &[u8]) -> Self
     where
-        Self: Sized;
+        Self: Sized,
+    {
+        let _ = bytes;
+        panic!("{} gives no checkpoint: build its vtable with ProtocolVTable::checkpointed or ProtocolVTable::live", std::any::type_name::<Self>())
+    }
 
     /// Runs just before the task is freed. If it panics, the task is still dropped and freed, and
     /// the panic goes on after that, with a vtable from [`ProtocolVTable::of`] or
@@ -71,6 +83,15 @@ pub unsafe trait ProtocolTask: Send + Sync + 'static {
     /// Roughly how many bytes the task holds; the capitulation strategy reads it.
     fn footprint_estimate(&self) -> usize {
         std::mem::size_of_val(self)
+    }
+
+    /// The task's next moment: after every poll that leaves the task in its row, the scheduler
+    /// asks, and wakes the task with [`WakeReason::Timer`] at the moment it gives, dormant or not.
+    /// Each answer replaces the one before; `None` (the default) sets none. A task woken at fixed
+    /// intervals declares that in its policy instead
+    /// ([`TaskPolicy::interval`](crate::TaskPolicy::interval)).
+    fn wake_at(&self) -> Option<Instant> {
+        None
     }
 }
 
@@ -113,12 +134,15 @@ pub struct ProtocolVTable {
     restore_fn: unsafe fn(&[u8]) -> *mut (),
     destroy_fn: unsafe fn(*mut ()),
     footprint_fn: unsafe fn(*const ()) -> usize,
+    wake_at_fn: unsafe fn(*const ()) -> Option<Instant>,
+    gives_checkpoint: bool,
     type_id: fn() -> TypeId,
     type_name: fn() -> &'static str,
 }
 
 // SAFETY (all six): `data` is a live, exclusively held `T` from `Box::<T>::into_raw`, reached
-// only through a ProtocolTaskPtr whose vtable is `ProtocolVTable::of::<T>()` (built by `from_box`,
+// only through a ProtocolTaskPtr whose vtable is `ProtocolVTable::of::<T>()`, `checkpointed::<T>()`
+// or `live::<T>()` (built by `from_box`,
 // `restore_from_bytes`, or a caller of `ProtocolTaskPtr::from_raw_parts` who promised exactly that).
 unsafe fn task_poll<T: ProtocolTask>(data: *mut ()) -> TaskPoll {
     // SAFETY: see above; the call itself is ProtocolTask's contract.
@@ -166,12 +190,45 @@ unsafe fn task_footprint<T: ProtocolTask>(data: *const ()) -> usize {
     unsafe { (*(data as *const T)).footprint_estimate() }
 }
 
+unsafe fn task_wake_at<T: ProtocolTask>(data: *const ()) -> Option<Instant> {
+    // SAFETY: see above.
+    unsafe { (*(data as *const T)).wake_at() }
+}
+
+/// The `wake_at` of a vtable built from hand-written functions: no moment.
+unsafe fn no_wake_at(_: *const ()) -> Option<Instant> {
+    None
+}
+
+unsafe fn given_save<T: ProtocolTask + Checkpoint>(data: *mut ()) -> Vec<u8> {
+    // SAFETY: see above.
+    unsafe { (*(data as *const T)).save() }
+}
+
+fn given_restore<T: ProtocolTask + Checkpoint>(bytes: &[u8]) -> *mut () {
+    match <T as Checkpoint>::restore(bytes) {
+        Ok(restored) => Box::into_raw(Box::new(restored)) as *mut (),
+        Err(why) => panic!("{} refused its checkpoint: {why}", std::any::type_name::<T>()),
+    }
+}
+
+/// The checkpoint function of a [`ProtocolVTable::live`] vtable; the scheduler never calls it.
+unsafe fn live_checkpoint<T: ProtocolTask>(_: *mut ()) -> Vec<u8> {
+    panic!("{} gives no checkpoint (its vtable is ProtocolVTable::live)", std::any::type_name::<T>())
+}
+
+/// The restore function of a [`ProtocolVTable::live`] vtable; the scheduler never calls it.
+fn live_restore<T: ProtocolTask>(_: &[u8]) -> *mut () {
+    panic!("{} gives no checkpoint (its vtable is ProtocolVTable::live)", std::any::type_name::<T>())
+}
+
 impl ProtocolVTable {
-    /// The vtable of `T`.
+    /// The vtable of `T`, checkpointed through `T`'s own [`ProtocolTask::checkpoint`] and
+    /// [`ProtocolTask::restore`], as in 0.3.
     pub const fn of<T: ProtocolTask>() -> Self {
         // SAFETY: these are `T`'s own functions, each sound for a `T` from `Box::<T>::into_raw`
         // under ProtocolTask's contract (see the comment above `task_poll`).
-        unsafe {
+        let raw = unsafe {
             Self::from_raw_parts::<T>(
                 task_poll::<T>,
                 task_wake::<T>,
@@ -180,7 +237,31 @@ impl ProtocolVTable {
                 task_destroy::<T>,
                 task_footprint::<T>,
             )
-        }
+        };
+        Self { wake_at_fn: task_wake_at::<T>, ..raw }
+    }
+
+    /// The vtable of `T`, checkpointed through the state `T` gives: [`Checkpoint::save`] and
+    /// [`Checkpoint::restore`]. A `restore` that returns `Err` ends the task as Failed, with a
+    /// message naming the type and carrying the error.
+    pub const fn checkpointed<T: ProtocolTask + Checkpoint>() -> Self {
+        Self { checkpoint_fn: given_save::<T>, restore_fn: given_restore::<T>, ..Self::of::<T>() }
+    }
+
+    /// The vtable of `T`, a task whose state is live (a closure, a socket, a lock) and that gives
+    /// no checkpoint. The scheduler never checkpoints it: the capitulation strategy is not asked
+    /// about it, its policy's `dormancy_ttl` does not park it, Shutdown leaves it live in its row,
+    /// and a `Checkpoint` (or a `Capitulate` that keeps a stub), from its own poll or as a
+    /// message, leaves it live and is returned as an error (see
+    /// [`gives_checkpoint`](Self::gives_checkpoint)).
+    pub const fn live<T: ProtocolTask>() -> Self {
+        Self { checkpoint_fn: live_checkpoint::<T>, restore_fn: live_restore::<T>, gives_checkpoint: false, ..Self::of::<T>() }
+    }
+
+    /// Whether the scheduler may checkpoint a task of this vtable: false only for
+    /// [`live`](Self::live).
+    pub const fn gives_checkpoint(&self) -> bool {
+        self.gives_checkpoint
     }
 
     /// A vtable from hand-written functions, recorded as running `T`. It is `const`, so it can
@@ -255,6 +336,8 @@ impl ProtocolVTable {
             restore_fn,
             destroy_fn,
             footprint_fn,
+            wake_at_fn: no_wake_at,
+            gives_checkpoint: true,
             type_id: TypeId::of::<T>,
             type_name: std::any::type_name::<T>,
         }
@@ -294,6 +377,13 @@ impl ProtocolVTable {
     /// [`from_raw_parts`](Self::from_raw_parts).
     pub const fn footprint_fn(&self) -> unsafe fn(*const ()) -> usize {
         self.footprint_fn
+    }
+
+    /// The function that reads a task's next moment ([`ProtocolTask::wake_at`]); a vtable from
+    /// [`from_raw_parts`](Self::from_raw_parts) has one that gives none. Calling it is `unsafe`,
+    /// as [`footprint_fn`](Self::footprint_fn).
+    pub const fn wake_at_fn(&self) -> unsafe fn(*const ()) -> Option<Instant> {
+        self.wake_at_fn
     }
 
     /// Whether this vtable runs `T`.
@@ -450,6 +540,16 @@ impl ProtocolTaskPtr {
         // SAFETY: `data` is not null, so it is a live task until Drop, of the vtable's type (as
         // `poll`); footprint_estimate is a safe trait method that only reads.
         unsafe { (self.vtable.footprint_fn)(self.data as *const ()) }
+    }
+
+    /// The task's next moment ([`ProtocolTask::wake_at`]); `None` for an empty pointer (a null
+    /// `data`), whose vtable is not called.
+    pub fn wake_at(&self) -> Option<Instant> {
+        if self.data.is_null() {
+            return None;
+        }
+        // SAFETY: as `footprint_estimate`; wake_at is a safe trait method that only reads.
+        unsafe { (self.vtable.wake_at_fn)(self.data as *const ()) }
     }
 
     /// The raw task pointer, read through a shared reference, as 0.2.0's public `data` field could

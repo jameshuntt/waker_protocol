@@ -48,8 +48,8 @@ pub enum Resident {
     /// Checkpointed out; restored when woken (by policy).
     Dormant,
     /// Out of its row while the scheduler works on it. No row is left this way when `run_once` or
-    /// `pump` returns. A panic in the task's own `poll`, `on_wake`, `checkpoint`, `restore` or
-    /// `footprint_estimate` ends the task as Failed; a panic in a message's `deliver` loses only
+    /// `pump` returns. A panic in the task's own `poll`, `on_wake`, `checkpoint`, `restore`,
+    /// `footprint_estimate` or `wake_at` ends the task as Failed; a panic in a message's `deliver` loses only
     /// that message; a panic from the store's `save` or from the capitulation strategy reaches the
     /// caller with the task put back in its row, live. The store's `load` and `remove` are never
     /// called while the task is out of its row (see [`run_once`](WakerProtocol::run_once)).
@@ -87,6 +87,13 @@ pub struct TaskEntry<H> {
     /// one kept with the task dormant, `auto_restore_on_wake` off), and when a `Yield` or a
     /// checkpoint keeps the task runnable for a poll it is owed.
     pub runnable_seq: u64,
+
+    /// When its policy's `interval` next wakes it with `WakeReason::Timer`; set from its spawn, and
+    /// moved on by each tick. `None` while the policy sets no interval.
+    pub next_tick: Option<Instant>,
+    /// The moment its last poll asked to be woken at ([`ProtocolTask::wake_at`]); cleared when it
+    /// comes, or replaced by the next poll's answer.
+    pub wake_at: Option<Instant>,
 }
 
 impl<H> TaskEntry<H> {
@@ -99,6 +106,8 @@ impl<H> TaskEntry<H> {
     ) -> Self {
         let mut pending_wakes = VecDeque::new();
         pending_wakes.push_back(WakeReason::Spawn);
+        let stats = TaskStats::new();
+        let next_tick = policy.interval.filter(|every| !every.is_zero()).and_then(|every| stats.created_at.checked_add(every));
 
         Self {
             key,
@@ -106,12 +115,47 @@ impl<H> TaskEntry<H> {
             resident,
             state: TaskState::Runnable,
             policy,
-            stats: TaskStats::new(),
+            stats,
             mailbox: VecDeque::new(),
             pending_wakes,
             checkpoint_history: VecDeque::new(),
             runnable_seq,
+            next_tick,
+            wake_at: None,
         }
+    }
+
+    /// When the task is parked if nothing reaches it first: live, its vtable giving a checkpoint,
+    /// with no work and no poll `owed`, and its policy setting a `dormancy_ttl`; then the time since
+    /// its last poll (or its spawn) reaches that.
+    fn parks_at(&self, owed: bool) -> Option<Instant> {
+        let ttl = self.policy.dormancy_ttl?;
+        let idle = matches!(self.resident, Resident::Live(_)) && self.vtable.gives_checkpoint() && !owed && !self.is_runnable();
+        let since = self.stats.last_polled_at.unwrap_or(self.stats.created_at);
+        idle.then(|| since.checked_add(ttl)).flatten()
+    }
+
+    /// Whether a tick of its interval or its `wake_at` moment has come by `now`; moves both on.
+    fn timer_due(&mut self, now: Instant) -> bool {
+        let mut due = false;
+        match self.policy.interval.filter(|every| !every.is_zero()) {
+            None => self.next_tick = None,
+            Some(every) => {
+                let next = *self.next_tick.get_or_insert_with(|| now.checked_add(every).unwrap_or(now));
+                if next <= now {
+                    due = true;
+                    // Fixed rate: the next tick is the first multiple of `every` after `now`.
+                    let behind = now.duration_since(next).as_nanos() / every.as_nanos() + 1;
+                    let ahead = u64::try_from(every.as_nanos().saturating_mul(behind)).unwrap_or(u64::MAX);
+                    self.next_tick = next.checked_add(Duration::from_nanos(ahead));
+                }
+            }
+        }
+        if self.wake_at.is_some_and(|at| at <= now) {
+            self.wake_at = None;
+            due = true;
+        }
+        due
     }
 
     /// Dormant, and kept so by its policy: `auto_restore_on_wake` is off.
@@ -468,7 +512,7 @@ pub struct WakerProtocol<S: CheckpointStore> {
     pub reclaim_log: Vec<ReclaimReport<S::Handle>>,
     /// Every task the scheduler has removed, oldest first, with the state it ended in:
     /// `Completed`, `Cancelled`, or `Failed` with its message. A task that panicked in its own
-    /// `poll`, `on_wake`, `checkpoint`, `restore` or `footprint_estimate` is here as `Failed`, its
+    /// `poll`, `on_wake`, `checkpoint`, `restore`, `footprint_estimate` or `wake_at` is here as `Failed`, its
     /// message naming the panic. Like `reclaim_log` it only grows; clear it once read.
     pub finished: Vec<(TaskId, TaskState)>,
     /// Settings.
@@ -587,13 +631,17 @@ impl<S: CheckpointStore> WakerProtocol<S> {
 
     /// Handle every queued message, then poll every runnable task once.
     ///
+    /// Between the two, it wakes with `WakeReason::Timer` every task whose policy's `interval`
+    /// tick or whose [`wake_at`](ProtocolTask::wake_at) moment has come, then parks every task
+    /// past its policy's `dormancy_ttl` (checkpointed, `CheckpointReason::Idle`, and dormant).
+    ///
     /// An error does not stop the round. A message refused for being written for another task
     /// type, or one whose `deliver` returns `Err`, is dropped and its task goes on; a checkpoint
     /// that cannot be saved leaves its task live in its row as it was; a task whose checkpoint
     /// cannot be loaded stays dormant. Once the round is done, every error it met is returned,
     /// joined with `"; "`.
     ///
-    /// A panic in a task's own `poll`, `on_wake`, `checkpoint`, `restore` or `footprint_estimate`
+    /// A panic in a task's own `poll`, `on_wake`, `checkpoint`, `restore`, `footprint_estimate` or `wake_at`
     /// is caught: the task ends as `TaskState::Failed`, with a message naming the panic, and is
     /// removed like any failed task (see [`finished`](Self::finished)); the round goes on. A panic
     /// in a message's `deliver`, or in the `kind` or `target_type` of an
@@ -623,6 +671,8 @@ impl<S: CheckpointStore> WakerProtocol<S> {
     }
 
     /// Wait up to `timeout` for a message, then run a round as [`run_once`](Self::run_once) does.
+    /// It waits no longer than the scheduler's next moment: a task's interval tick, its `wake_at`
+    /// moment, or the time its `dormancy_ttl` parks it.
     ///
     /// Returns `Ok(true)` while the scheduler runs and `Ok(false)` once a Shutdown message has
     /// been handled; from then on it returns `Ok(false)` at once and does nothing. Dropping every
@@ -646,10 +696,48 @@ impl<S: CheckpointStore> WakerProtocol<S> {
         }
 
         let mut errors = Errors::default();
-        // The scheduler holds a sender itself, so this ends with a message or the timeout.
-        let first = self.rx.recv_timeout(timeout).ok();
+        let now = Instant::now();
+        let wait = self.next_moment().map_or(timeout, |at| timeout.min(at.saturating_duration_since(now)));
+        // The scheduler holds a sender itself, so this ends with a message or the wait.
+        let first = self.rx.recv_timeout(wait).ok();
         self.round(first, &mut errors);
         errors.finish().map(|()| !self.shutdown)
+    }
+
+    /// The earliest moment a task is due: an interval tick, a `wake_at` moment, or a dormancy
+    /// deadline.
+    fn next_moment(&self) -> Option<Instant> {
+        self.tasks
+            .live_ids()
+            .into_iter()
+            .filter_map(|id| self.tasks.get(id).map(|entry| (id, entry)))
+            .flat_map(|(id, entry)| [entry.next_tick, entry.wake_at, entry.parks_at(self.owed.contains(&id))])
+            .flatten()
+            .min()
+    }
+
+    /// Wake with `WakeReason::Timer` every task whose interval tick or `wake_at` moment has come.
+    fn fire_timers(&mut self, now: Instant) {
+        for id in self.tasks.live_ids() {
+            let seq = self.seq;
+            let Some(entry) = self.tasks.get_mut(id) else { continue };
+            if entry.timer_due(now) {
+                entry.wake(WakeReason::Timer, seq);
+                self.bump_seq();
+            }
+        }
+    }
+
+    /// Checkpoint (`CheckpointReason::Idle`) every task whose `dormancy_ttl` has passed with no work.
+    fn park_idle(&mut self, now: Instant, errors: &mut Errors) {
+        for id in self.tasks.live_ids() {
+            let owed = self.owed.contains(&id);
+            let Some(entry) = self.tasks.get_mut(id) else { continue };
+            if entry.parks_at(owed).is_some_and(|at| at <= now) {
+                let live = entry.take_live();
+                errors.note(self.settle(id, live, Settle::Checkpoint(CheckpointReason::Idle)));
+            }
+        }
     }
 
     fn bump_seq(&mut self) -> u64 {
@@ -667,6 +755,9 @@ impl<S: CheckpointStore> WakerProtocol<S> {
         }
         self.drain_inbox(errors);
         if !self.shutdown {
+            let now = Instant::now();
+            self.fire_timers(now);
+            self.park_idle(now, errors);
             self.poll_ready(errors);
         }
     }
@@ -843,7 +934,7 @@ impl<S: CheckpointStore> WakerProtocol<S> {
 
     /// Deliver task `id`'s messages and wakes, ask the strategy, then poll it. Every error is
     /// noted in `errors`, and the task always ends settled: live, dormant or removed. A panic in
-    /// the task's `footprint_estimate`, `on_wake` or `poll` ends it as Failed; a panic in a
+    /// the task's `footprint_estimate`, `on_wake`, `poll` or `wake_at` ends it as Failed; a panic in a
     /// message's `deliver` loses only that message; a panic from the strategy reaches the caller
     /// with the task back in its row, live.
     fn poll_one(&mut self, id: TaskId, errors: &mut Errors) {
@@ -852,7 +943,8 @@ impl<S: CheckpointStore> WakerProtocol<S> {
         let owed = self.owed.contains(&id);
         let Some(entry) = self.tasks.get_mut(id) else { return };
         // The strategy sees the task as it was before this round's messages and wakes.
-        let snapshot = if restored { None } else { Self::snapshot(id, entry) };
+        // Nor about a task that gives no checkpoint: every plan it could carry out needs one.
+        let snapshot = if restored || !entry.vtable.gives_checkpoint() { None } else { Self::snapshot(id, entry) };
         let last_wake = entry.pending_wakes.back().or(entry.stats.last_wake.as_ref()).cloned();
         let had_work = entry.has_work(owed);
         let Some(live) = entry.take_live() else { return };
@@ -891,10 +983,15 @@ impl<S: CheckpointStore> WakerProtocol<S> {
             entry.stats.last_polled_at = Some(Instant::now());
             let task = out.task();
             // SAFETY: the task is out of its row, so this call has exclusive access to a live task (ProtocolTask's contract).
-            match caught("poll", || unsafe { task.poll() }) {
-                Ok(poll) => Settle::after_poll(poll, &entry.policy),
-                Err(panic) => Settle::Finish(TaskState::Failed(panic)),
+            let poll = match caught("poll", || unsafe { task.poll() }) {
+                Ok(poll) => poll,
+                Err(panic) => break 'settle Settle::Finish(TaskState::Failed(panic)),
+            };
+            match caught("wake_at", || task.wake_at()) {
+                Ok(at) => entry.wake_at = at,
+                Err(panic) => break 'settle Settle::Finish(TaskState::Failed(panic)),
             }
+            Settle::after_poll(poll, &entry.policy)
         };
         let live = out.release();
         errors.note(self.settle(id, Some(live), settle));
@@ -926,7 +1023,18 @@ impl<S: CheckpointStore> WakerProtocol<S> {
             }
             Settle::Checkpoint(reason) => {
                 let owed = self.owed.contains(&id);
-                self.checkpoint_live(id, live, reason, owed)
+                let gives = self.tasks.get(id).is_none_or(|entry| entry.vtable.gives_checkpoint());
+                if gives {
+                    return self.checkpoint_live(id, live, reason, owed);
+                }
+                // A task that gives no checkpoint stays live, runnable if it is owed a poll.
+                let state = if owed { TaskState::Runnable } else { TaskState::Waiting };
+                let type_name = live.vtable().type_name();
+                self.put_back(id, live, state, None)?;
+                if self.shutdown {
+                    return Ok(());
+                }
+                Err(format!("task {id:?} ({type_name}) gives no checkpoint: {reason:?} not taken, it stays live"))
             }
             Settle::Finish(state) => self.finish(id, state, Some(live)),
         }
